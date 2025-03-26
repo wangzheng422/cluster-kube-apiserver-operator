@@ -101,19 +101,13 @@ During certificate rotation, the system outputs:
 
 ### Logs
 
-系统会通过klog记录证书更新的详细信息，例如在更新CA证书包时会记录"Updated ca-bundle.crt configmap %s/%s with:\n%s"。
+The system logs detailed information about certificate updates using klog, for example, when updating the CA bundle it logs: `Updated ca-bundle.crt configmap %s/%s with:\n%s`.
 
 ### Status Conditions
 
-如果证书轮换过程中出现错误，系统会更新CertRotationDegraded状态条件，并设置原因为"RotationError"。
-当状态更新成功且有错误时，系统会记录一个警告事件："RotationError"，包含错误信息。
+If errors occur during the certificate rotation process, the system updates the **CertRotationDegraded** status condition and sets the reason to **RotationError**.
 
-## 证书轮换的触发条件包括：
-
-证书已过期
-证书已达到有效期的80%（如果RefreshOnlyWhenExpired为false）
-证书已超过刷新时间（如果设置了Refresh参数）
-签名CA发生变化
+When the status is successfully updated and there are errors, the system records a warning event: **RotationError**, containing the error information.
 
 ## Conclusion
 
