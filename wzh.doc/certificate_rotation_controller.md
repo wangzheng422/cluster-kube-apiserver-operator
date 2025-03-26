@@ -4,6 +4,43 @@
 
 This document analyzes the internal loop mechanism of the certificate rotation controller in the OpenShift Kubernetes API server operator. The analysis focuses on how the controller manages certificate rotation, particularly for the "KubeAPIServerToKubeletClientCert" rotation.
 
+
+## Flowchart
+
+```mermaid
+flowchart TD
+    A[CertRotationController.Run] --> B[Start goroutines for each certRotator]
+    B --> C[certRotator.Run]
+    C --> D[baseController.Run]
+    D --> E[Start worker goroutines]
+    E --> F[runWorker]
+    F --> G[wait.UntilWithContext]
+    G --> H[Infinite Loop]
+    H --> I{select}
+    I -->|queueCtx.Done| J[Return]
+    I -->|default| K[processNextWorkItem]
+    K --> L[Get key from queue]
+    L --> M[reconcile]
+    M --> N[sync]
+    N --> O[SyncWorker]
+    O --> P[EnsureSigningCertKeyPair]
+    O --> Q[EnsureConfigMapCABundle]
+    O --> R[EnsureTargetCertKeyPair]
+    R -->|Success| S[Forget key]
+    R -->|Error| T[AddRateLimited key]
+    
+    Z[Resync Mechanism] -->|Every minute| AA[Add DefaultQueueKey]
+    AA --> H
+```
+
+The diagram shows:
+1. Controller initialization and goroutine creation
+2. The core infinite loop with queue processing
+3. Certificate rotation workflow (3 key steps)
+4. Error handling and requeue logic
+5. Periodic resync mechanism
+
+
 ## Controller Structure
 
 The certificate rotation process is managed by the `CertRotationController` in `pkg/operator/certrotationcontroller/certrotationcontroller.go`. This controller creates and manages multiple certificate rotators, each responsible for rotating specific certificates.
@@ -138,7 +175,7 @@ The internal loop that handles certificate rotation is implemented in the factor
 
 ## Resync Mechanism
 
-The controller also has a resync mechanism that adds items to the queue periodically:
+The controller also has a resync mechanism that adds items to the queue periodically in `vendor/github.com/openshift/library-go/pkg/controller/factory/base_controller.go`:
 
 ```go
 if c.resyncEvery > 0 {
