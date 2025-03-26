@@ -45,7 +45,7 @@ func (c *CertRotationController) Run(ctx context.Context, workers int) {
 
 The internal loop that handles certificate rotation is implemented in the factory controller pattern in the OpenShift library-go package. Here's how it works:
 
-1. Each `certRotator.Run(ctx, workers)` call executes the `baseController.Run` method:
+1. Each `certRotator.Run(ctx, workers)` call executes the `baseController.Run` method from `vendor/github.com/openshift/library-go/pkg/controller/factory/base_controller.go`:
 
     ```go
     func (c *baseController) Run(ctx context.Context, workers int) {
@@ -61,7 +61,7 @@ The internal loop that handles certificate rotation is implemented in the factor
     }
     ```
 
-2. The `runWorker` method contains the actual internal loop:
+2. The `runWorker` method in `vendor/github.com/openshift/library-go/pkg/controller/factory/base_controller.go` contains the actual internal loop:
 
     ```go
     func (c *baseController) runWorker(queueCtx context.Context) {
@@ -82,7 +82,7 @@ The internal loop that handles certificate rotation is implemented in the factor
     }
     ```
 
-3. The `processNextWorkItem` method gets an item from the queue and processes it:
+3. The `processNextWorkItem` method in `vendor/github.com/openshift/library-go/pkg/controller/factory/base_controller.go` gets an item from the queue and processes it:
 
    ```go
    func (c *baseController) processNextWorkItem(queueCtx context.Context) {
@@ -104,7 +104,7 @@ The internal loop that handles certificate rotation is implemented in the factor
    }
    ```
 
-4. The `reconcile` method calls the `sync` method, which for the certificate rotator calls `SyncWorker`:
+4. The `reconcile` method calls the `sync` method, which for the certificate rotator calls `SyncWorker` from `vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go`:
 
    ```go
    func (c CertRotationController) Sync(ctx context.Context, syncCtx factory.SyncContext) error {
@@ -114,7 +114,7 @@ The internal loop that handles certificate rotation is implemented in the factor
    }
    ```
 
-5. The `SyncWorker` method performs the actual certificate rotation:
+5. The `SyncWorker` method in `vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go` performs the actual certificate rotation:
 
    ```go
    func (c CertRotationController) SyncWorker(ctx context.Context) error {
