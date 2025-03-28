@@ -88,25 +88,21 @@ func ManageClientCABundle(ctx context.Context, lister corev1listers.ConfigMapLis
 }
 ```
 
-### 3.3 CSR机制触发
+### 3.3 kubelet-client 证书的更新机制
 
-当新的`kubelet-client`证书被创建并存储在Secret中后，它不会直接触发Kubernetes CSR（证书签名请求）机制。相反，它是通过以下方式工作的：
+当新的 `kubelet-client` 证书被创建并存储在 Secret 中后，它不会直接触发 Kubernetes CSR（证书签名请求）机制。相反，证书轮转控制器直接生成新的证书，并将其存储在 Secret 中。kube-apiserver Pod 重启时（由于配置更改或手动触发），会加载新的证书，并使用这个新证书与 kubelet 通信。
 
-1. 证书轮转控制器创建新的`kubelet-client`证书，并将其存储在Secret中
-2. 当kube-apiserver Pod重启时（由于配置更改或手动触发），它会加载新的证书
-3. kube-apiserver使用这个新证书与kubelet通信
+### 3.4 Kubelet 如何验证 kube-apiserver 的证书
 
-kubelet本身不会直接参与这个证书轮转过程。它只是验证连接到它的kube-apiserver是否提供了有效的证书。
+kubelet 不需要重新部署来接受新的 kube-apiserver 证书。这是因为：
 
-### 3.4 Kubelet重新部署
+1.  这个证书是 kube-apiserver 用来向 kubelet 进行身份验证的客户端证书。
+2.  kubelet 验证 kube-apiserver 提供的证书是否由其信任的 CA 签名。  kubelet 通过 `--kubelet-client-ca` 标志指定的 CA 证书文件来验证 kube-apiserver 的客户端证书。这个 CA 证书包通常在集群设置期间分发到各个节点。
 
-kubelet不需要重新部署来接受新的kube-apiserver证书。这是因为：
+当 kube-apiserver 使用新证书连接到 kubelet 时，只要该证书由 kubelet 信任的 CA 签名，kubelet 就会接受连接。这种设计使得证书轮转对 kubelet 透明，不需要重启或重新部署 kubelet。
 
-1. 这个证书是kube-apiserver用来向kubelet进行身份验证的客户端证书
-2. kubelet只需要验证这个证书是否由它信任的CA签名
-3. CA证书包通常在kubelet配置中指定，并且在集群设置期间分发到各个节点
+Cluster Version Operator (CVO) 似乎负责 kubernetes-client-ca.crt 的轮替。
 
-当kube-apiserver使用新证书连接到kubelet时，只要该证书由kubelet信任的CA签名，kubelet就会接受连接。这种设计使得证书轮转对kubelet透明，不需要重启或重新部署kubelet。
 
 ## 4. 证书检查和轮转决策
 
@@ -149,7 +145,72 @@ func needNewTargetCertKeyPairForTime(annotations map[string]string, signer *cryp
 }
 ```
 
-## 5. 总结
+## 5. CA证书轮转机制
+
+CA证书（签名证书）本身也有有效期限制，并且也会自动轮转。从代码中可以看到，`kube-apiserver-to-kubelet-signer` CA证书的配置如下：
+
+```go
+certrotation.RotatedSigningCASecret{
+    Namespace: operatorclient.OperatorNamespace,
+    Name:      "kube-apiserver-to-kubelet-signer",
+    AdditionalAnnotations: certrotation.AdditionalAnnotations{
+        JiraComponent: "kube-apiserver",
+    },
+    Validity: 1 * 365 * defaultRotationDay, // 有效期为1年
+    Refresh:  292 * defaultRotationDay,     // 约80%的有效期后刷新
+    RefreshOnlyWhenExpired: refreshOnlyWhenExpired,
+    // ...
+}
+```
+
+CA证书的有效期设置为1年，并且会在其有效期的约80%（292天）时进行刷新。这意味着CA证书本身也会在过期前自动轮转。
+
+当CA证书轮转时，会发生以下过程：
+
+1. 创建新的CA证书和密钥对
+2. 将新的CA证书添加到CA证书包中
+3. 旧的CA证书保留在证书包中，直到它过期
+4. 新的目标证书将使用新的CA证书进行签名
+
+这种机制确保了在CA证书轮转期间有一个平滑的过渡期，在此期间新旧CA证书都被信任。这允许使用新CA签名的证书逐步推出，而不会中断服务。
+
+### 5.1 CA证书包管理
+
+CA证书包的管理是通过`CombineCABundleConfigMaps`函数实现的：
+
+```go
+func CombineCABundleConfigMaps(destinationConfigMap ResourceLocation, lister corev1listers.ConfigMapLister, additionalAnnotations certrotation.AdditionalAnnotations, inputConfigMaps ...ResourceLocation) (*corev1.ConfigMap, error) {
+    certificates := []*x509.Certificate{}
+    // 收集所有输入配置映射中的证书
+    for _, input := range inputConfigMaps {
+        // ... 获取和解析证书 ...
+        certificates = append(certificates, inputCerts...)
+    }
+
+    // 过滤掉过期的证书
+    certificates = crypto.FilterExpiredCerts(certificates...)
+    
+    // 去除重复的证书
+    finalCertificates := []*x509.Certificate{}
+    // ... 去重逻辑 ...
+
+    // 编码证书并创建配置映射
+    caBytes, err := crypto.EncodeCertificates(finalCertificates...)
+    // ... 创建配置映射 ...
+    
+    return cm, nil
+}
+```
+
+这个函数确保：
+1. 收集所有相关的CA证书
+2. 过滤掉已过期的证书
+3. 去除重复的证书
+4. 将有效的证书编码并存储在配置映射中
+
+通过这种方式，系统可以自动管理CA证书的生命周期，包括添加新的CA证书和移除过期的CA证书。
+
+## 6. 总结
 
 kube-apiserver到kubelet的证书轮转是一个自动化过程，确保kube-apiserver可以安全地与集群中的kubelet通信。这个过程包括：
 
