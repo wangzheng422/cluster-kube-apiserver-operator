@@ -101,7 +101,41 @@ kubelet 不需要重新部署来接受新的 kube-apiserver 证书。这是因�
 
 当 kube-apiserver 使用新证书连接到 kubelet 时，只要该证书由 kubelet 信任的 CA 签名，kubelet 就会接受连接。这种设计使得证书轮转对 kubelet 透明，不需要重启或重新部署 kubelet。
 
-Cluster Version Operator (CVO) 似乎负责 kubernetes-client-ca.crt 的轮替。
+
+```bash
+/usr/bin/kubelet --config=/etc/kubernetes/kubelet.conf --bootstrap-kubeconfig=/etc/kubernetes/kubeconfig --kubeconfig=/var/lib/kubelet/ku
+beconfig --container-runtime-endpoint=/var/run/crio/crio.sock --runtime-cgroups=/system.slice/crio.service --node-labels=node-role.kubernetes.io/control-plane,node-role.kubernetes.io/master
+,node.openshift.io/os_id=rhcos --node-ip=192.168.50.23 --minimum-container-ttl-duration=6m0s --cloud-provider= --volume-plugin-dir=/etc/kubernetes/kubelet-plugins/volume/exec --hostname-ove
+rride= --provider-id= --register-with-taints=node-role.kubernetes.io/master=:NoSchedule --pod-infra-container-image=quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:57574e9a41103d84d71
+3251cfd189a8027060c3fdd2a8cf31438acba24c33095 --system-reserved=cpu=500m,memory=1Gi,ephemeral-storage=1Gi --v=2
+
+
+cat /etc/kubernetes/kubelet.conf
+......
+  "authentication": {
+    "x509": {
+      "clientCAFile": "/etc/kubernetes/kubelet-ca.crt"
+    },
+    "webhook": {
+      "cacheTTL": "0s"
+    },
+    "anonymous": {
+      "enabled": false
+    }
+  },
+......
+
+```
+
+OpenShift 4.14+ 中管理 /etc/kubernetes/kubelet.conf 配置的操作为 Machine Config Operator。clientCAFile 设置（指向 /etc/kubernetes/kubelet-ca.crt）由 Machine Config Operator 维护。更新 /etc/kubernetes/kubelet-ca.crt 文件的操作为 [Machine Config Operator（MCO）](https://github.com/openshift/machine-config-operator/tree/main)
+
+
+CA 证书存储在名为 "service-ca/signing-key" 的秘密中，位于集群中，字段包括 tls.crt（证书）、tls.key（私钥）和 ca-bundle.crt（CA 捆绑包）[Service CA Operator GitHub Repository](https://github.com/openshift/service-ca-operator)。
+
+service-ca Operator 支持自动轮转，当 CA 证书的有效期少于 13 个月时会自动刷新，证书有效期为 26 个月
+
+
+
 
 
 ## 4. 证书检查和轮转决策
