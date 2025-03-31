@@ -19,8 +19,7 @@ flowchart TD
     D --> E[更新CA证书包]
     E --> F[创建新的目标证书]
     F --> G[更新Secret: kubelet-client]
-    G --> H[通过ResourceSyncController同步证书]
-    H --> I[kube-apiserver Pod重启]
+    G --> I[kube-apiserver Pod重启]
     I --> J[kube-apiserver使用新证书连接kubelet]
     J --> K[kubelet验证kube-apiserver身份]
     K --> B
@@ -67,7 +66,7 @@ certRotator = certrotation.NewCertRotationController(
 
 ### 3.2 证书分发机制
 
-证书创建后，通过`ResourceSyncController`进行分发。这个控制器负责将证书从源位置同步到目标位置。
+证书创建后，通过`ResourceSyncController`进行分发。这个控制器负责将证书从源位置同步到目标位置。但是在本项目中，由于operator已经正确的写入目标secret, configmap了，所以不需要这部分ManageClientCABundle的逻辑。
 
 在`ManageClientCABundle`函数中，我们可以看到证书是如何被组合和分发的：
 
