@@ -1,10 +1,10 @@
-# Kubernetes 证书更替过程与监控方案
+# Kubernetes Certificate Rotation Process and Monitoring Solution
 
-## 背景
+## Background
 
-在使用 OpenShift 时，用户经常会注意到 OpenShift 会创建/更新证书。这些证书的创建过程会占用 CPU 资源，在 CPU 敏感型场景下，证书更新可能导致性能问题。这些创建证书或更新证书的时间点对客户来说比较困惑，无法预知一个准确的时间点。因此，本文将分析这些证书是怎么来的、由谁维护以及它们会在什么时候进行更新，以便我们在未来运维中做好相应计划。
+When using OpenShift, users often notice that OpenShift creates/updates certificates. The certificate creation process consumes CPU resources, which may cause performance issues in CPU-sensitive scenarios. The timing of certificate creation or updates can be confusing for customers, as they cannot predict an exact time. Therefore, this article will analyze how these certificates are created, who maintains them, and when they will be updated, so that we can make appropriate plans for future operations and maintenance.
 
-OpenShift在Kubernetes基础上做了很多增强，其中一个最显著的区别是大量使用了Operator。这些Operator管理的TLS和CA证书，我们可以用如下命令查看：
+OpenShift has made many enhancements on top of Kubernetes, one of the most significant differences being the extensive use of Operators. We can view the TLS and CA certificates managed by these Operators using the following commands:
 
 ```bash
 # get current time
@@ -67,30 +67,30 @@ oc get configmap -A -o json | jq -r '.items[] | select(.data["service-ca.crt"] o
 
 ```
 
-我们可以看到，有大量的证书存在，并且大部分证书都在1-2年内过期。其中，最让客户有明显感受的，也是 [Red Hat Case 03857456](https://docs.google.com/document/d/16U2TLCRglmwPWYfjZu-nBtZSHp7JeujNDFXldVRdtHk/edit?tab=t.0#heading=h.tqctc166nwq9) 故障的起点，就是 `openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-signer` 这个证书的过期。它的过期会导致API Server重启，对集群有一定的影响。
+We can see that there are a large number of certificates, and most of them expire within 1-2 years. Among them, the most noticeable to customers, and also the starting point of [Red Hat Case 03857456](https://docs.google.com/document/d/16U2TLCRglmwPWYfjZu-nBtZSHp7JeujNDFXldVRdtHk/edit?tab=t.0#heading=h.tqctc166nwq9) failure, is the expiration of the `openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-signer` certificate. Its expiration will cause the API Server to restart, which has a certain impact on the cluster.
 
-本文档详细介绍 Kubernetes 集群中的证书更替过程，特别是 kube-apiserver 到 kubelet 的证书轮转机制，以及如何在更新前和更新过程中对证书进行有效监控。`openshift-kube-apiserver-operator`的源代码在[这里](https://github.com/openshift/cluster-kube-apiserver-operator)，本文的分析基于对源代码的研究，分析过程中使用了AI辅助技术。
+This document details the certificate rotation process in a Kubernetes cluster, especially the certificate rotation mechanism from kube-apiserver to kubelet, and how to effectively monitor certificates before and during updates. The source code for `openshift-kube-apiserver-operator` is [here](https://github.com/openshift/cluster-kube-apiserver-operator), and this analysis is based on research of the source code, with the assistance of AI technology during the analysis process.
 
-## 1. 证书轮转概述
+## 1. Certificate Rotation Overview
 
-在 Kubernetes 集群中，证书轮转是一个自动化过程，确保证书在过期前被更新，从而保持集群的安全性和可用性。证书轮转控制器（CertRotationController）负责管理多个证书轮转器，每个轮转器负责特定类型的证书的更新工作。
+In a Kubernetes cluster, certificate rotation is an automated process that ensures certificates are updated before they expire, thereby maintaining the security and availability of the cluster. The Certificate Rotation Controller (CertRotationController) is responsible for managing multiple certificate rotators, each responsible for updating a specific type of certificate.
 
-### 1.1 证书轮转控制器结构
+### 1.1 Certificate Rotation Controller Structure
 
-证书轮转控制器在 `pkg/operator/certrotationcontroller/certrotationcontroller.go` 中实现，主要包含以下组件：
+The certificate rotation controller is implemented in `pkg/operator/certrotationcontroller/certrotationcontroller.go` and mainly includes the following components:
 
 ```go
 type CertRotationController struct {
     certRotators []factory.Controller
-    // ... 其他字段
+    // ... other fields
 }
 ```
 
-每个证书轮转器负责一种特定类型的证书，例如 `KubeAPIServerToKubeletClientCert`、`AggregatorProxyClientCert` 等。
+Each certificate rotator is responsible for a specific type of certificate, such as `KubeAPIServerToKubeletClientCert`, `AggregatorProxyClientCert`, etc.
 
-### 1.2 证书轮转器配置
+### 1.2 Certificate Rotator Configuration
 
-以 `KubeAPIServerToKubeletClientCert` 为例，其配置如下：
+Taking `KubeAPIServerToKubeletClientCert` as an example, its configuration is as follows:
 
 ```go
 certRotator = certrotation.NewCertRotationController(
@@ -101,32 +101,30 @@ certRotator = certrotation.NewCertRotationController(
         AdditionalAnnotations: certrotation.AdditionalAnnotations{
             JiraComponent: "kube-apiserver",
         },
-        Validity: 1 * 365 * defaultRotationDay, // 有效期为 1 年
-        // 刷新时间设置为有效期的 80%
+        Validity: 1 * 365 * defaultRotationDay, // Validity period is 1 year
+        // Refresh time is set to 80% of the validity period
         Refresh:                292 * defaultRotationDay,
         RefreshOnlyWhenExpired: refreshOnlyWhenExpired,
         EventRecorder: eventRecorder,
-        // ... 其他配置
+        // ... other configurations
     },
-    // ... 其他配置
+    // ... other configurations
 )
 ```
 
-关键参数说明：
-- **Validity**: 证书的有效期，这里设置为 1 年
-- **Refresh**: 证书的刷新期，这里设置为 292 天（约为有效期的 80%）
-- **RefreshOnlyWhenExpired**: 是否仅在证书过期时才刷新，如果设为true则只有在证书过期时才会刷新
+Key parameter explanations:
+- **Validity**: The validity period of the certificate, set to 1 year here
+- **Refresh**: The refresh period of the certificate, set to 292 days here (approximately 80% of the validity period)
+- **RefreshOnlyWhenExpired**: Whether to refresh only when the certificate expires; if set to true, it will only refresh when the certificate expires
 
+When a CA certificate rotates, the following process occurs:
 
-当 CA 证书轮转时，会发生以下过程：
+1. Create a new CA certificate and key pair
+2. Add the new CA certificate to the CA certificate bundle
+3. The old CA certificate is retained in the certificate bundle until it expires
+4. New target certificates will be signed using the new CA certificate
 
-1. 创建新的 CA 证书和密钥对
-2. 将新的 CA 证书添加到 CA 证书包中
-3. 旧的 CA 证书保留在证书包中，直到它过期
-4. 新的目标证书将使用新的 CA 证书进行签名
-
-这种机制确保了在 CA 证书轮转期间有一个平滑的过渡期，在此期间新旧 CA 证书都被信任，从而避免服务中断。
-
+This mechanism ensures a smooth transition period during CA certificate rotation, during which both old and new CA certificates are trusted, thereby avoiding service interruptions.
 
 ```go
 certrotation.CABundleConfigMap{
@@ -136,14 +134,14 @@ certrotation.CABundleConfigMap{
 				JiraComponent: "kube-apiserver",
 			},
 			EventRecorder: eventRecorder,
-      // ... 其他配置
+      // ... other configurations
 		},
 ```
 
-关键参数说明：
-- **Namespace**: ConfigMap 所在的命名空间，这里是操作员的命名空间
-- **Name**: ConfigMap 的名称，用于存储 CA 证书包
-- **EventRecorder**: 用于记录与证书相关的事件，便于后续监控和故障排查
+Key parameter explanations:
+- **Namespace**: The namespace where the ConfigMap is located, which is the operator's namespace here
+- **Name**: The name of the ConfigMap, used to store the CA certificate bundle
+- **EventRecorder**: Used to record certificate-related events, facilitating subsequent monitoring and troubleshooting
 
 ```go
 		certrotation.RotatedSelfSignedCertKeySecret{
@@ -158,49 +156,48 @@ certrotation.CABundleConfigMap{
 				UserInfo: &user.DefaultInfo{Name: "system:kube-apiserver", Groups: []string{"kube-master"}},
 			},
 			EventRecorder: eventRecorder,
-      // ... 其他配置
+      // ... other configurations
 		},
 ```
 
-关键参数说明：
-- **Namespace**: Secret 所在的命名空间，这里是目标命名空间
-- **Name**: Secret 的名称，用于存储客户端证书和密钥
-- **Validity**: 证书的有效期，这里设置为 30 天
-- **Refresh**: 证书的刷新期，这里设置为 15 天（约为有效期的 50%）
-- **CertCreator**: 证书创建器，指定了证书的用户信息（system:kube-apiserver），这决定了证书的权限范围
+Key parameter explanations:
+- **Namespace**: The namespace where the Secret is located, which is the target namespace here
+- **Name**: The name of the Secret, used to store the client certificate and key
+- **Validity**: The validity period of the certificate, set to 30 days here
+- **Refresh**: The refresh period of the certificate, set to 15 days here (approximately 50% of the validity period)
+- **CertCreator**: The certificate creator, specifying the user information of the certificate (system:kube-apiserver), which determines the permission scope of the certificate
 
+From the above data structure, we can infer that the CA bundle update also follows the client certificate update, because the CA bundle is used to verify the client certificate. When the client certificate needs to be updated, the corresponding CA bundle also needs to be updated to ensure the integrity of the verification chain.
 
-从上面的数据结构，我们可以推断，CA bundle 的更新也是跟随客户端证书更新的，因为 CA bundle 是用于验证客户端证书的。当客户端证书需要更新时，相应的 CA bundle 也需要更新以确保验证链的完整性。
+## 2. Certificate Rotation Internal Mechanism
 
-## 2. 证书轮转内部机制
+With the core data structure, let's look at the overall process of certificate updates. This process is not only used internally by `openshift-kube-apiserver-operator`, but also calls common class libraries, so this pattern can be reused in multiple Operators, ensuring the consistency and reliability of the certificate rotation mechanism.
 
-有了核心数据结构，我们来看看证书更新的整体流程。这种流程并不仅仅是`openshift-kube-apiserver-operator`内部使用，而是调用了公共类库，因此这个模式能够在多个Operator中复用，保证了证书轮转机制的一致性和可靠性。
-
-### 2.1 控制器执行流程
+### 2.1 Controller Execution Flow
 
 ```mermaid
 flowchart TD
-    A[CertRotationController.Run] --> B[启动每个 certRotator 的 goroutine]
+    A[CertRotationController.Run] --> B[Start goroutine for each certRotator]
     B --> C[certRotator.Run]
     C --> D[baseController.Run]
-    D --> E[启动工作线程]
+    D --> E[Start worker threads]
     E --> F[runWorker]
     F --> G[wait.UntilWithContext]
-    G --> H[无限循环]
+    G --> H[Infinite loop]
     H --> I{select}
-    I -->|queueCtx.Done| J[返回]
+    I -->|queueCtx.Done| J[Return]
     I -->|default| K[processNextWorkItem]
-    K --> L[从队列获取 key]
+    K --> L[Get key from queue]
     L --> M[reconcile]
     M --> N[sync]
     N --> O[SyncWorker]
     O --> P[EnsureSigningCertKeyPair]
     O --> Q[EnsureConfigMapCABundle]
     O --> R[EnsureTargetCertKeyPair]
-    R -->|成功| S[忘记 key]
-    R -->|错误| T[添加限速 key]
+    R -->|Success| S[Forget key]
+    R -->|Error| T[Add rate-limited key]
     
-    Z[Resync Mechanism] -->|每分钟| AA[添加 DefaultQueueKey]
+    Z[Resync Mechanism] -->|Every minute| AA[Add DefaultQueueKey]
     AA --> H
 ```
 
@@ -357,44 +354,43 @@ if c.resyncEvery > 0 {
 
 By default, this resync happens every minute, ensuring certificates are checked regularly and rotated when needed based on their validity periods and refresh settings.
 
+After the controller starts, it creates a goroutine for each certificate rotator, and each rotator runs an infinite loop that periodically checks the certificate status and rotates it when needed. This parallel processing approach ensures that the rotation processes of various types of certificates do not interfere with each other, improving the reliability of the system.
 
-控制器启动后，会为每个证书轮转器创建一个 goroutine，每个轮转器都会运行一个无限循环，定期检查证书状态并在需要时进行轮转。这种并行处理的方式确保了各类证书的轮转过程互不干扰，提高了系统的可靠性。
+### 2.2 Certificate Rotation Process
 
-### 2.2 证书轮转过程
+The certificate rotation process includes three main steps:
 
-证书轮转过程包括三个主要步骤：
+1. **EnsureSigningCertKeyPair**: Ensure the signing CA certificate and key pair are valid, creating or rotating them if needed
+2. **EnsureConfigMapCABundle**: Update the CA certificate bundle ConfigMap with the current signing CA certificate
+3. **EnsureTargetCertKeyPair**: Ensure the target certificate and key pair are valid, creating or rotating them if needed
 
-1. **EnsureSigningCertKeyPair**: 确保签名 CA 证书和密钥对有效，如果需要则创建或轮转它们
-2. **EnsureConfigMapCABundle**: 使用当前签名 CA 证书更新 CA 证书包配置映射
-3. **EnsureTargetCertKeyPair**: 确保目标证书和密钥对有效，如果需要则创建或轮转它们
+### 2.3 Certificate Rotation Decision Logic
 
-### 2.3 证书轮转决策逻辑
-
-控制器使用以下逻辑来决定何时轮转证书，这是证书轮转过程中的核心决策机制：
+The controller uses the following logic to decide when to rotate certificates, which is the core decision mechanism in the certificate rotation process:
 
 ```go
 func needNewTargetCertKeyPairForTime(annotations map[string]string, signer *crypto.CA, refresh time.Duration, refreshOnlyWhenExpired bool) string {
-    // 检查证书是否已过期
+    // Check if the certificate has already expired
     if time.Now().After(notAfter) {
         return "already expired"
     }
 
-    // 如果设置了只在过期时刷新，则不进行提前刷新
+    // If set to refresh only when expired, do not perform early refresh
     if refreshOnlyWhenExpired {
         return ""
     }
 
-    // 检查是否达到有效期的 80%
+    // Check if it has reached 80% of the validity period
     validity := notAfter.Sub(notBefore)
     at80Percent := notAfter.Add(-validity / 5)
     if time.Now().After(at80Percent) {
         return fmt.Sprintf("past its latest possible time %v", at80Percent)
     }
 
-    // 检查是否达到预设的刷新时间
+    // Check if it has reached the preset refresh time
     refreshTime := notBefore.Add(refresh)
     if time.Now().After(refreshTime) {
-        // 确保签名 CA 已有效超过目标刷新时间的 10%
+        // Ensure the signing CA has been valid for more than 10% of the target refresh time
         timeToWaitForTrustRotation := refresh / 10
         if time.Now().After(signer.Config.Certs[0].NotBefore.Add(time.Duration(timeToWaitForTrustRotation))) {
             return fmt.Sprintf("past its refresh time %v", refreshTime)
@@ -405,57 +401,57 @@ func needNewTargetCertKeyPairForTime(annotations map[string]string, signer *cryp
 }
 ```
 
-证书轮转的触发条件包括：
-- 证书已过期（最高优先级条件）
-- 证书有效期已达到 80%（如果 RefreshOnlyWhenExpired 为 false）
-- 达到预设的刷新时间（由Refresh参数指定）
+The conditions for triggering certificate rotation include:
+- The certificate has already expired (highest priority condition)
+- The certificate validity period has reached 80% (if RefreshOnlyWhenExpired is false)
+- The preset refresh time has been reached (specified by the Refresh parameter)
 
-这些条件确保了证书在过期前有足够的时间进行轮转，同时避免了不必要的频繁轮转。
+These conditions ensure that there is enough time for certificate rotation before expiration, while avoiding unnecessary frequent rotations.
 
-## 3. 证书轮转事件与日志
+## 3. Certificate Rotation Events and Logs
 
-### 3.1 事件触发机制
+### 3.1 Event Triggering Mechanism
 
-在证书轮转过程中，系统会在关键节点触发 Kubernetes 事件，这些事件可以通过 `kubectl get events` 命令查看。这些事件为监控和故障排查提供了重要的信息源。
+During the certificate rotation process, the system triggers Kubernetes events at key points, which can be viewed using the `kubectl get events` command. These events provide important sources of information for monitoring and troubleshooting.
 
-#### 3.1.1 签名 CA 证书轮转事件
+#### 3.1.1 Signing CA Certificate Rotation Events
 
-当签名 CA 证书需要轮转时，系统会触发事件：
+When a signing CA certificate needs to be rotated, the system triggers an event:
 
 ```go
 c.EventRecorder.Eventf("SignerUpdateRequired", "%q in %q requires a new signing cert/key pair: %v", c.Name, c.Namespace, reason)
 ```
 
-#### 3.1.2 CA 证书包更新事件
+#### 3.1.2 CA Certificate Bundle Update Events
 
-当 CA 证书包需要更新时，系统会触发事件：
+When a CA certificate bundle needs to be updated, the system triggers an event:
 
 ```go
 c.EventRecorder.Eventf("CABundleUpdateRequired", "%q in %q requires a new cert", c.Name, c.Namespace)
 ```
 
-#### 3.1.3 目标证书轮转事件
+#### 3.1.3 Target Certificate Rotation Events
 
-当目标证书需要轮转时，系统会触发事件：
+When a target certificate needs to be rotated, the system triggers an event:
 
 ```go
 c.EventRecorder.Eventf("TargetUpdateRequired", "%q in %q requires a new target cert/key pair: %v", c.Name, c.Namespace, reason)
 ```
 
-### 3.2 事件与证书更新的时间关系
+### 3.2 Relationship Between Events and Certificate Updates
 
-**重要发现**：证书轮转事件和实际证书更新在同一个控制器周期内立即发生：
+**Important finding**: Certificate rotation events and actual certificate updates occur immediately within the same controller cycle:
 
-1. 控制器每分钟运行检查（由resync机制触发）
-2. 当证书需要轮转时，会发出事件（例如 `SignerUpdateRequired`）
-3. 在同一个函数调用中，立即创建并应用新证书
-4. 事件发出和证书更新之间没有延迟，它们是原子操作
+1. The controller runs checks every minute (triggered by the resync mechanism)
+2. When a certificate needs to be rotated, an event is issued (e.g., `SignerUpdateRequired`)
+3. In the same function call, a new certificate is immediately created and applied
+4. There is no delay between the event being issued and the certificate being updated; they are atomic operations
 
-这意味着当我们观察到证书轮转事件时，相应的证书更新操作已经完成或正在进行中，这对于监控和故障排查非常重要。
+This means that when we observe a certificate rotation event, the corresponding certificate update operation has already been completed or is in progress, which is very important for monitoring and troubleshooting.
 
-### 3.3 日志记录机制
+### 3.3 Logging Mechanism
 
-除了 Kubernetes 事件外，证书轮转过程中的关键操作也会记录到系统日志中，提供更详细的信息：
+In addition to Kubernetes events, key operations in the certificate rotation process are also recorded in the system logs, providing more detailed information:
 
 ```go
 klog.Infof("Starting CertRotation")
@@ -463,44 +459,44 @@ klog.Infof("Waiting for CertRotation")
 klog.V(2).Infof("Updated ca-bundle.crt configmap %s/%s with:\n%s", certs.CertificateBundleToString(updatedCerts), caBundleConfigMap.Namespace, caBundleConfigMap.Name)
 ```
 
-## 4. kube-apiserver 到 kubelet 的证书轮转流程
+## 4. kube-apiserver to kubelet Certificate Rotation Flow
 
-以下是kube-apiserver到kubelet的证书轮转的详细流程，这是整个证书轮转机制中最关键的部分之一：
+Below is the detailed flow of certificate rotation from kube-apiserver to kubelet, which is one of the most critical parts of the entire certificate rotation mechanism:
 
-### 4.1 证书轮转流程图
+### 4.1 Certificate Rotation Flow Chart
 
 ```mermaid
 flowchart TD
-    A[证书轮转控制器启动] --> B[定期检查证书状态]
-    B --> C{证书需要轮转?}
-    C -->|否| B
-    C -->|是| D[创建新的签名CA证书]
-    D --> E[更新CA证书包]
-    E --> F[创建新的目标证书]
-    F --> G[更新Secret: kubelet-client]
-    G --> I[kube-apiserver Pod重启]
-    I --> J[kube-apiserver使用新证书连接kubelet]
-    J --> K[kubelet验证kube-apiserver身份]
+    A[Certificate Rotation Controller starts] --> B[Periodically check certificate status]
+    B --> C{Certificate needs rotation?}
+    C -->|No| B
+    C -->|Yes| D[Create new signing CA certificate]
+    D --> E[Update CA certificate bundle]
+    E --> F[Create new target certificate]
+    F --> G[Update Secret: kubelet-client]
+    G --> I[kube-apiserver Pod restarts]
+    I --> J[kube-apiserver uses new certificate to connect to kubelet]
+    J --> K[kubelet verifies kube-apiserver identity]
     K --> B
 ```
 
-### 4.3 kubelet 如何验证 kube-apiserver 的证书
+### 4.3 How kubelet Verifies kube-apiserver's Certificate
 
-kubelet 不需要重新部署来接受新的 kube-apiserver 证书。这是因为：
+The kubelet does not need to be redeployed to accept the new kube-apiserver certificate. This is because:
 
-1. 这个证书是 kube-apiserver 用来向 kubelet 进行身份验证的客户端证书
-2. kubelet 验证 kube-apiserver 提供的证书是否由其信任的 CA 签名
-3. kubelet 通过 `--kubelet-client-ca` 标志指定的 CA 证书文件来验证 kube-apiserver 的客户端证书
+1. This certificate is a client certificate used by kube-apiserver to authenticate to kubelet
+2. The kubelet verifies whether the certificate provided by kube-apiserver is signed by a trusted CA
+3. The kubelet verifies kube-apiserver's client certificate using the CA certificate file specified by the `--kubelet-client-ca` flag
 
-这种机制确保了证书轮转过程中的平滑过渡，无需重启或重新配置kubelet。
+This mechanism ensures a smooth transition during the certificate rotation process, without the need to restart or reconfigure the kubelet.
 
-kubelet 的配置示例：
+Example kubelet configuration:
 
 ```bash
 /usr/bin/kubelet --config=/etc/kubernetes/kubelet.conf --bootstrap-kubeconfig=/etc/kubernetes/kubeconfig --kubeconfig=/var/lib/kubelet/kubeconfig --container-runtime-endpoint=/var/run/crio/crio.sock ...
 ```
 
-kubelet.conf 中的相关配置：
+Relevant configuration in kubelet.conf:
 
 ```yaml
 "authentication": {
@@ -516,40 +512,40 @@ kubelet.conf 中的相关配置：
 },
 ```
 
-OpenShift 4.14+ 中，`/etc/kubernetes/kubelet.conf` 配置由 Machine Config Operator 管理，`clientCAFile` 设置（指向 `/etc/kubernetes/kubelet-ca.crt`）也由 Machine Config Operator 维护。这种集中管理的方式简化了证书管理流程，提高了系统的可靠性。
+In OpenShift 4.14+, the `/etc/kubernetes/kubelet.conf` configuration is managed by the Machine Config Operator, and the `clientCAFile` setting (pointing to `/etc/kubernetes/kubelet-ca.crt`) is also maintained by the Machine Config Operator. This centralized management approach simplifies the certificate management process and improves the reliability of the system.
 
-## 5. 证书监控方案 (待验证)
+## 5. Certificate Monitoring Solution (To Be Verified)
 
-我们已经知道证书更新时会产生Kubernetes层面的event，也会产生日志，因此我们可以通过监控这些event和日志来实现对证书轮转的监控。这种监控对于预防证书过期导致的服务中断至关重要。具体的监控方案可以参考以下步骤：
+We already know that certificate updates generate Kubernetes-level events and logs, so we can monitor these events and logs to implement monitoring of certificate rotation. This monitoring is crucial for preventing service interruptions caused by certificate expiration. The specific monitoring solution can refer to the following steps:
 
-### 5.1 基于事件的监控
+### 5.1 Event-Based Monitoring
 
-证书轮转控制器在执行证书轮转操作时会生成特定的 Kubernetes 事件。我们可以监控这些事件来获取证书轮转的实时信息，及时了解证书状态变化：
+The certificate rotation controller generates specific Kubernetes events when performing certificate rotation operations. We can monitor these events to get real-time information about certificate rotation and timely understand certificate status changes:
 
-1. **监控关键事件类型**：
-   - `SignerUpdateRequired`：签名 CA 证书需要更新
-   - `CABundleUpdateRequired`：CA 证书包需要更新
-   - `TargetUpdateRequired`：目标证书需要更新
+1. **Monitor key event types**:
+   - `SignerUpdateRequired`: Signing CA certificate needs to be updated
+   - `CABundleUpdateRequired`: CA certificate bundle needs to be updated
+   - `TargetUpdateRequired`: Target certificate needs to be updated
 
-2. **事件监控实现方式**：
+2. **Event monitoring implementation**:
    ```bash
-   # 使用 kubectl 监控特定命名空间中的证书轮转事件
+   # Use kubectl to monitor certificate rotation events in a specific namespace
    kubectl get events -n openshift-kube-apiserver-operator --field-selector reason=SignerUpdateRequired,reason=CABundleUpdateRequired,reason=TargetUpdateRequired
    
-   # 使用 watch 命令实时监控
+   # Use the watch command for real-time monitoring
    watch "kubectl get events -n openshift-kube-apiserver-operator | grep -E 'SignerUpdateRequired|CABundleUpdateRequired|TargetUpdateRequired'"
    ```
 
-3. **集成到监控系统**：
-   - 将事件收集到 Prometheus 中，可以使用 Kubernetes Event Exporter
-   - 在 Grafana 中创建专门的证书轮转事件面板
-   - 配置基于事件的告警规则
+3. **Integration with monitoring systems**:
+   - Collect events into Prometheus, using Kubernetes Event Exporter
+   - Create dedicated certificate rotation event dashboards in Grafana
+   - Configure event-based alerting rules
 
-### 5.2 基于日志的监控
+### 5.2 Log-Based Monitoring
 
-证书轮转过程中的关键操作会记录到系统日志中，我们可以通过监控这些日志来跟踪证书轮转过程，获取更详细的操作信息：
+Key operations in the certificate rotation process are recorded in the system logs. We can track the certificate rotation process by monitoring these logs and obtain more detailed operation information:
 
-1. **关键日志模式**：
+1. **Key log patterns**:
    ```
    "Starting CertRotation"
    "Waiting for CertRotation"
@@ -557,25 +553,25 @@ OpenShift 4.14+ 中，`/etc/kubernetes/kubelet.conf` 配置由 Machine Config Op
    "Creating new target cert/key pair"
    ```
 
-2. **日志监控实现**：
+2. **Log monitoring implementation**:
    ```bash
-   # 查看 kube-apiserver-operator 的日志
+   # View kube-apiserver-operator logs
    kubectl logs -n openshift-kube-apiserver-operator deployment/kube-apiserver-operator | grep -E "CertRotation|cert/key|ca-bundle"
    
-   # 使用 OpenShift Logging 或 EFK 堆栈收集和分析日志
+   # Use OpenShift Logging or EFK stack to collect and analyze logs
    ```
 
-3. **日志告警配置**：
-   - 配置日志分析工具（如 Loki、Elasticsearch）以检测证书轮转相关的日志模式
-   - 设置基于日志模式的告警规则
+3. **Log alert configuration**:
+   - Configure log analysis tools (such as Loki, Elasticsearch) to detect certificate rotation-related log patterns
+   - Set up alerting rules based on log patterns
 
-### 5.3 证书过期监控
+### 5.3 Certificate Expiry Monitoring
 
-为了提前获得证书即将更新的告警，我们需要监控证书的过期时间，这是最直接的预防措施：
+To get alerts before certificates are about to be updated, we need to monitor the expiration time of certificates, which is the most direct preventive measure:
 
-1. **证书过期时间检查**：
+1. **Certificate expiration time check**:
    ```bash
-   # 创建一个脚本来检查所有 TLS 类型的 Secret 中的证书过期时间
+   # Create a script to check the expiration time of certificates in all TLS type Secrets
    #!/bin/bash
    
    echo -e "NAMESPACE\tNAME\tEXPIRY\tDAYS_LEFT"
@@ -589,7 +585,7 @@ OpenShift 4.14+ 中，`/etc/kubernetes/kubelet.conf` 配置由 Machine Config Op
      fi
    done | sort -t $'\t' -k4,4n | column -t
    ```
-  这个脚本的输出类似这样：
+  The output of this script is similar to this:
   ```log
   NAMESPACE       NAME    EXPIRY  DAYS_LEFT
   openshift-config-managed                          kube-controller-manager-client-cert-key             Apr  20  04:37:04  2025  GMT  19
@@ -605,38 +601,38 @@ OpenShift 4.14+ 中，`/etc/kubernetes/kubelet.conf` 配置由 Machine Config Op
   openshift-kube-apiserver                          service-network-serving-certkey                     Apr  20  04:37:13  2025  GMT  19
   openshift-kube-controller-manager                 csr-signer                                          Apr  20  04:39:51  2025  GMT  19
   ```
-2. **Prometheus 监控集成**：
-   - 创建自定义 Prometheus Exporter 来暴露证书过期信息
-   - 使用 OpenShift Monitoring 或自定义 Prometheus 实例收集这些指标
+2. **Prometheus Monitoring Integration**:
+   - Create a custom Prometheus Exporter to expose certificate expiration information
+   - Use OpenShift Monitoring or a custom Prometheus instance to collect these metrics
 
-### 5.4 基于证书类型的差异化告警规则
+### 5.4 Differentiated Alerting Rules Based on Certificate Types
 
-不同类型的证书有不同的有效期和刷新时间，因此需要针对不同类型的证书设置不同的告警规则。这种差异化的告警策略可以更精确地监控各类证书的生命周期。以下是基于证书类型的差异化告警规则：
+Different types of certificates have different validity periods and refresh times, so different alerting rules need to be set for different types of certificates. This differentiated alerting strategy can more precisely monitor the lifecycle of various types of certificates. Below are differentiated alerting rules based on certificate types:
 
-#### 5.4.1 证书类型及其特性
+#### 5.4.1 Certificate Types and Their Characteristics
 
-以下是一些关键证书的过期时间和刷新时间的示例，这些信息对于设置合理的告警阈值至关重要：
+Below are examples of expiration times and refresh times for some key certificates, which are important for setting reasonable alerting thresholds:
 
-| 证书类型 | 有效期 | 刷新时间 | 刷新百分比 | 建议告警阈值 |
+| Certificate Type | Validity Period | Refresh Time | Refresh Percentage | Recommended Alert Threshold |
 |---------|-------|---------|----------|------------|
-| kube-apiserver-to-kubelet-signer | 365天 | 292天 | 80% | 60天 |
-| kubelet-client | 30天 | 15天 | 50% | 7天 |
-| aggregator-client-signer | 365天 | 292天 | 80% | 60天 |
-| kube-control-plane-signer | 365天 | 292天 | 80% | 60天 |
-| node-system-admin-signer | 365天 | 292天 | 80% | 60天 |
-| loadbalancer-serving-signer | 3650天 | 2920天 | 80% | 180天 |
-| localhost-serving-signer | 3650天 | 2920天 | 80% | 180天 |
-| service-network-serving-signer | 3650天 | 2920天 | 80% | 180天 |
+| kube-apiserver-to-kubelet-signer | 365 days | 292 days | 80% | 60 days |
+| kubelet-client | 30 days | 15 days | 50% | 7 days |
+| aggregator-client-signer | 365 days | 292 days | 80% | 60 days |
+| kube-control-plane-signer | 365 days | 292 days | 80% | 60 days |
+| node-system-admin-signer | 365 days | 292 days | 80% | 60 days |
+| loadbalancer-serving-signer | 3650 days | 2920 days | 80% | 180 days |
+| localhost-serving-signer | 3650 days | 2920 days | 80% | 180 days |
+| service-network-serving-signer | 3650 days | 2920 days | 80% | 180 days |
 
-#### 5.4.2 差异化告警规则
+#### 5.4.2 Differentiated Alerting Rules
 
-以下是针对不同证书类型的 Prometheus 告警规则，这些规则可以直接集成到现有的监控系统中：
+Below are Prometheus alerting rules for different certificate types, which can be directly integrated into existing monitoring systems:
 
 ```yaml
 groups:
 - name: CertificateRotation
   rules:
-  # 短期证书告警规则 (30天有效期)
+  # Short-term certificate alerting rules (30-day validity)
   - alert: ShortTermCertificateApproachingRotation
     expr: |
       (
@@ -648,10 +644,10 @@ groups:
     labels:
       severity: warning
     annotations:
-      summary: "短期证书即将进行轮转"
-      description: "证书 {{ $labels.certificate_name }} (类型: {{ $labels.certificate_type }}) 在 {{ $labels.namespace }} 命名空间中将在 {{ $value }} 天后进行轮转。"
+      summary: "Short-term certificate approaching rotation"
+      description: "Certificate {{ $labels.certificate_name }} (type: {{ $labels.certificate_type }}) in namespace {{ $labels.namespace }} will be rotated in {{ $value }} days."
 
-  # 中期证书告警规则 (1年有效期)
+  # Medium-term certificate alerting rules (1-year validity)
   - alert: MediumTermCertificateApproachingRotation
     expr: |
       (
@@ -663,10 +659,10 @@ groups:
     labels:
       severity: warning
     annotations:
-      summary: "中期证书即将进行轮转"
-      description: "证书 {{ $labels.certificate_name }} (类型: {{ $labels.certificate_type }}) 在 {{ $labels.namespace }} 命名空间中将在 {{ $value }} 天后进行轮转。"
+      summary: "Medium-term certificate approaching rotation"
+      description: "Certificate {{ $labels.certificate_name }} (type: {{ $labels.certificate_type }}) in namespace {{ $labels.namespace }} will be rotated in {{ $value }} days."
 
-  # 长期证书告警规则 (10年有效期)
+  # Long-term certificate alerting rules (10-year validity)
   - alert: LongTermCertificateApproachingRotation
     expr: |
       (
@@ -678,10 +674,10 @@ groups:
     labels:
       severity: warning
     annotations:
-      summary: "长期证书即将进行轮转"
-      description: "证书 {{ $labels.certificate_name }} (类型: {{ $labels.certificate_type }}) 在 {{ $labels.namespace }} 命名空间中将在 {{ $value }} 天后进行轮转。"
+      summary: "Long-term certificate approaching rotation"
+      description: "Certificate {{ $labels.certificate_name }} (type: {{ $labels.certificate_type }}) in namespace {{ $labels.namespace }} will be rotated in {{ $value }} days."
 
-  # 通用证书过期严重告警
+  # General certificate near expiry critical alert
   - alert: CertificateNearExpiry
     expr: |
       (
@@ -693,13 +689,13 @@ groups:
     labels:
       severity: critical
     annotations:
-      summary: "证书即将过期"
-      description: "证书 {{ $labels.certificate_name }} 在 {{ $labels.namespace }} 命名空间中将在 {{ $value }} 天内过期，需要立即处理！"
+      summary: "Certificate near expiry"
+      description: "Certificate {{ $labels.certificate_name }} in namespace {{ $labels.namespace }} will expire in {{ $value }} days, immediate action required!"
 ```
 
-### 5.5 证书轮转事件的特定告警
+### 5.5 Specific Alerts for Certificate Rotation Events
 
-除了基于证书过期时间的告警外，还可以设置基于证书轮转事件的告警，这有助于监控证书轮转的频率和异常情况：
+In addition to alerts based on certificate expiration time, alerts based on certificate rotation events can also be set up, which helps monitor the frequency and abnormal situations of certificate rotation:
 
 ```yaml
 groups:
@@ -714,8 +710,8 @@ groups:
     labels:
       severity: info
     annotations:
-      summary: "证书轮转正在进行"
-      description: "证书 {{ $labels.certificate_name }} 在 {{ $labels.namespace }} 命名空间中正在进行轮转操作。"
+      summary: "Certificate rotation in progress"
+      description: "Certificate {{ $labels.certificate_name }} in namespace {{ $labels.namespace }} is undergoing rotation."
 
   - alert: FrequentCertificateRotation
     expr: |
@@ -726,14 +722,14 @@ groups:
     labels:
       severity: warning
     annotations:
-      summary: "证书频繁轮转"
-      description: "证书 {{ $labels.certificate_name }} 在 {{ $labels.namespace }} 命名空间中在过去24小时内进行了多次轮转，可能存在配置问题。"
+      summary: "Frequent certificate rotation"
+      description: "Certificate {{ $labels.certificate_name }} in namespace {{ $labels.namespace }} has undergone multiple rotations in the past 24 hours, there may be a configuration issue."
 ```
 
-## 6. 总结
+## 6. Summary
 
-证书轮转是 Kubernetes 集群安全机制的重要组成部分。通过了解证书轮转的内部机制和实现适当的监控方案，可以确保证书更新过程的平稳进行，避免因证书过期导致的服务中断。
+Certificate rotation is an important part of the security mechanism of Kubernetes clusters. By understanding the internal mechanism of certificate rotation and implementing appropriate monitoring solutions, the smooth progress of the certificate update process can be ensured, avoiding service interruptions caused by certificate expiration.
 
-在证书更新前和更新过程中进行有效监控，可以帮助管理员及时发现潜在问题，确保集群的安全和稳定运行。通过部署基于证书类型的差异化告警规则，可以更精确地监控不同类型证书的生命周期，提前做好运维准备，避免因证书轮转导致的意外问题。
+Effective monitoring before and during certificate updates can help administrators discover potential problems in a timely manner, ensuring the security and stable operation of the cluster. By deploying differentiated alerting rules based on certificate types, the lifecycle of different types of certificates can be monitored more precisely, and operational preparations can be made in advance to avoid unexpected problems caused by certificate rotation.
 
-为了做一个完整的证书过期和更新监控方案，我们需要针对目标集群，收集所有的operator，并研究源代码，确定证书明确和更新时间点，并根据这些信息来编写监控告警规则。
+To create a comprehensive certificate expiration and renewal monitoring solution, we need to collect all operators for the target cluster, study the source code to determine the exact certificate and renewal timestamps, and then write monitoring and alerting rules based on this information.
