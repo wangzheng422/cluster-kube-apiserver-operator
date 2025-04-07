@@ -1,3 +1,5 @@
+> [!WARNING] 
+> working in progress, use with caution.
 # Kubernetes Certificate Rotation Process and Monitoring Solution
 
 ## Background
@@ -515,6 +517,9 @@ Relevant configuration in kubelet.conf:
 In OpenShift 4.14+, the `/etc/kubernetes/kubelet.conf` configuration is managed by the Machine Config Operator, and the `clientCAFile` setting (pointing to `/etc/kubernetes/kubelet-ca.crt`) is also maintained by the Machine Config Operator. This centralized management approach simplifies the certificate management process and improves the reliability of the system.
 
 ## 5. Certificate Monitoring Solution (To Be Verified)
+
+> [!WARNING] 
+> pending on verification, testing and implementation detail, do not use.
 
 We already know that certificate updates generate Kubernetes-level events and logs, so we can monitor these events and logs to implement monitoring of certificate rotation. This monitoring is crucial for preventing service interruptions caused by certificate expiration. The specific monitoring solution can refer to the following steps:
 
