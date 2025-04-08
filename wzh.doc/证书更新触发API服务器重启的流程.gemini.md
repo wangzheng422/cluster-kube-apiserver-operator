@@ -115,7 +115,7 @@
         }
         ```
     *   `manageInstallationPods` 方法 (在 `installer_controller.go` 中) 决定哪个节点需要更新 (`nodeToStartRevisionWith`)，检查是否需要等待 (`timeToWaitBeforeInstallingNextPod`)，然后可能为目标节点创建或管理一个 `installer` Pod (`ensureInstallerPod`)。它还会更新 `NodeStatus` 来反映安装进度或失败状态 (`newNodeStateForInstallInProgress`)。当 `NodeStatus` 中的 `TargetRevision` 被设置或更新时，这表示需要一个新的静态 Pod 版本。
-    *   `ensureInstallerPod` 函数负责创建实际的 `installer` Pod，该 Pod 会在目标节点上运行，并将新的静态 Pod 清单和相关资源写入节点的 `/etc/kubernetes/manifests/` 和 `/etc/kubernetes/static-pod-resources/` 目录。
+    *   `ensureInstallerPod` 函数负责创建实际的 `installer` Pod，该 Pod 会在目标节点上运行，并将新的静态 Pod 清单和相关资源写入节点的 `/etc/kubernetes/manifests/` 和 `/etc/kubernetes/static-pod-resources/` 目录。这里有一个惊奇的发现，`installer` pod直接写入本地硬盘文件，而不是走machine config operator下发。
 *   **Kubelet 行为**: Kubelet 对 `/etc/kubernetes/manifests/` 目录的监视和基于文件变化的 Pod 重启是 Kubernetes 的标准行为，不由 Operator 代码直接控制，而是 Kubelet 的内置功能。
 
 ## 5. Mermaid 流程图
@@ -146,7 +146,7 @@ flowchart TD
     I --> J;
     N --> A;
 
-    style CertRotationController fill:#f9f,stroke:#333,stroke-width:2px;
+    style CertRotationController fill:#fff9c4,stroke:#333,stroke-width:2px;
     style InstallerController fill:#ccf,stroke:#333,stroke-width:2px;
     style Kubelet fill:#cfc,stroke:#333,stroke-width:2px;
 ```

@@ -482,6 +482,161 @@ flowchart TD
     K --> B
 ```
 
+### kubelet-client 证书更新触发 kube-apiserver 重启的详细流程
+
+在 OpenShift 集群中，`cluster-kube-apiserver-operator` 负责管理 `kube-apiserver` 的生命周期，包括其配置和相关证书。其中，`kubelet-client` 证书用于 `kube-apiserver` 向 `kubelet` 发起请求时的身份验证。该证书由 `CertRotationController` 自动轮转。一个常见的观察现象是，当 `kubelet-client` 证书更新时，`kube-apiserver` 的 Pod 会发生重启。本章节旨在详细解释这一过程背后的逻辑流和关键代码路径。
+
+#### 2. 核心组件
+
+参与此流程的关键组件包括：
+
+*   **CertRotationController**: `library-go` 库提供的通用控制器，用于管理证书的自动轮转。在 `cluster-kube-apiserver-operator` 中，它被配置用来管理 `kubelet-client` 等证书。
+*   **kubelet-client Secret**: 存储 `kube-apiserver` 用于连接 `kubelet` 的客户端证书和私钥。位于 `openshift-kube-apiserver` 命名空间。
+*   **InstallerController**: `library-go` 库提供的静态 Pod 控制器。`cluster-kube-apiserver-operator` 使用它来管理 `kube-apiserver` 静态 Pod 的部署和更新。它监视输入资源（如 Secrets、ConfigMaps），并在这些资源变化时触发 Pod 的更新（滚动）。
+*   **Kubelet**: 运行在每个 Master 节点上，负责根据 `/etc/kubernetes/manifests/` 目录下的静态 Pod 清单文件来启动和管理 `kube-apiserver` Pod。
+
+#### 3. 逻辑流程
+
+以下是 `kubelet-client` 证书更新导致 `kube-apiserver` 重启的详细逻辑步骤：
+
+1.  **证书轮转检查**: `CertRotationController` (在 `cluster-kube-apiserver-operator` Pod 内运行) 定期（默认为每分钟通过 `resync` 机制触发）检查其管理的证书。对于 `kubelet-client` 证书，它会检查是否满足轮转条件（例如，是否到达了预设的 `Refresh` 时间，对于 `kubelet-client` 是 15 天）。
+2.  **触发证书更新**: 当满足轮转条件时，`CertRotationController` 的 `SyncWorker` 函数被调用。
+3.  **生成新证书**: `SyncWorker` 调用 `RotatedSelfSignedCertKeySecret.EnsureTargetCertKeyPair` 函数。此函数生成一个新的 `kubelet-client` 证书和私钥对。
+4.  **更新 Secret**: `EnsureTargetCertKeyPair` 函数随后调用 Kubernetes API，更新 `openshift-kube-apiserver` 命名空间中的 `kubelet-client` Secret 对象，写入新的证书和私钥。
+5.  **InstallerController 检测变化**: `InstallerController` (同样在 `cluster-kube-apiserver-operator` Pod 内运行) 监视着 `kube-apiserver` 静态 Pod 所需的输入资源，其中包括 `kubelet-client` Secret。当它检测到 `kubelet-client` Secret 的内容发生变化时，会认为 `kube-apiserver` 的配置需要更新。
+6.  **创建新 Revision**: `InstallerController` 创建一个新的部署“修订版本（Revision）”。这通常涉及到创建一个新的 ConfigMap 或 Secret 来代表这个修订版本（例如 `kube-apiserver-pod-5`），并在 Operator 的状态中记录当前的 Revision 编号。
+7.  **更新静态 Pod 清单**: `InstallerController` 在每个 Master 节点上更新 `kube-apiserver` 的静态 Pod 清单文件（通常是 `/etc/kubernetes/manifests/kube-apiserver-pod.yaml`）。这个更新后的清单文件会引用新的 Revision 相关的资源（如果适用），并且其自身的元数据（如标签或注解）可能也会改变，以反映新的 Revision。
+8.  **Kubelet 检测清单变化**: 运行在 Master 节点上的 Kubelet 会监视 `/etc/kubernetes/manifests/` 目录。当它检测到 `kube-apiserver-pod.yaml` 文件发生变化时，它会读取新的清单。
+9.  **触发 Pod 重启**: Kubelet 比较新旧清单。由于清单内容（至少是其标识 Revision 的部分）发生了变化，Kubelet 会优雅地终止旧的 `kube-apiserver` Pod 容器，并根据新的清单文件启动一个新的 `kube-apiserver` Pod 容器。这个新的 Pod 会挂载更新后的 `kubelet-client` Secret。
+
+#### 4. 代码流关键点
+
+*   **证书检查与更新**:
+    *   `vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go`: `CertRotationController.SyncWorker` 是入口点。
+        ```go
+        func (c CertRotationController) SyncWorker(ctx context.Context) error {
+            signingCertKeyPair, err := c.RotatedSigningCASecret.EnsureSigningCertKeyPair(ctx)
+            if err != nil {
+                return err
+            }
+
+            cabundleCerts, err := c.CABundleConfigMap.EnsureConfigMapCABundle(ctx, signingCertKeyPair)
+            if err != nil {
+                return err
+            }
+
+            // This calls EnsureTargetCertKeyPair below
+            if _, err := c.RotatedSelfSignedCertKeySecret.EnsureTargetCertKeyPair(ctx, signingCertKeyPair, cabundleCerts); err != nil {
+                return err
+            }
+
+            return nil
+        }
+        ```
+    *   `vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go`: `RotatedSelfSignedCertKeySecret.EnsureTargetCertKeyPair` 负责检查轮转条件 (`NeedNewTargetCertKeyPair`)、生成新证书 (`setTargetCertKeyPairSecret`) 并更新 Secret (`resourceapply.ApplySecret`).
+        ```go
+        func (c RotatedSelfSignedCertKeySecret) EnsureTargetCertKeyPair(ctx context.Context, signingCertKeyPair *crypto.CA, caBundleCerts []*x509.Certificate) (*corev1.Secret, error) {
+            // ... (error handling and secret retrieval/creation) ...
+
+            applyFn := resourceapply.ApplySecret // Or resourceapply.ApplySecretDoNotUse if UseSecretUpdateOnly is true
+            // ... (metadata update) ...
+
+            // Check if a new cert is needed
+            if reason := c.CertCreator.NeedNewTargetCertKeyPair(targetCertKeyPairSecret, signingCertKeyPair, caBundleCerts, c.Refresh, c.RefreshOnlyWhenExpired); len(reason) > 0 {
+                c.EventRecorder.Eventf("TargetUpdateRequired", "%q in %q requires a new target cert/key pair: %v", c.Name, c.Namespace, reason)
+                // Generate and set the new cert/key in the secret data
+                if err := setTargetCertKeyPairSecret(targetCertKeyPairSecret, c.Validity, signingCertKeyPair, c.CertCreator, c.AdditionalAnnotations); err != nil {
+                    return nil, err
+                }
+
+                LabelAsManagedSecret(targetCertKeyPairSecret, CertificateTypeTarget)
+
+                // Apply the updated secret to the API server
+                actualTargetCertKeyPairSecret, _, err := applyFn(ctx, c.Client, c.EventRecorder, targetCertKeyPairSecret)
+                if err != nil {
+                    return nil, err
+                }
+                targetCertKeyPairSecret = actualTargetCertKeyPairSecret
+            }
+
+            return targetCertKeyPairSecret, nil
+        }
+        ```
+*   **静态 Pod 更新触发**:
+    *   `vendor/github.com/openshift/library-go/pkg/operator/staticpod/controller/installer/installer_controller.go`: `InstallerController.Sync` 是核心逻辑入口。它检查所需资源是否存在，然后调用 `manageInstallationPods` 来处理安装流程。
+        ```go
+        func (c InstallerController) Sync(ctx context.Context, syncCtx factory.SyncContext) error {
+            operatorSpec, originalOperatorStatus, _, err := c.operatorClient.GetStaticPodOperatorState()
+            if err != nil {
+                return err
+            }
+            operatorStatus := originalOperatorStatus.DeepCopy()
+
+            if !management.IsOperatorManaged(operatorSpec.ManagementState) {
+                return nil
+            }
+
+            // Ensure ConfigMaps/Secrets for the target revision exist
+            err = c.ensureRequiredResourcesExist(ctx, originalOperatorStatus.LatestAvailableRevision)
+
+            // Only manage installation pods when all required resources are present.
+            if err == nil {
+                // This function handles the node-by-node rollout logic
+                requeue, after, syncErr := c.manageInstallationPods(ctx, operatorSpec, operatorStatus)
+                if requeue && syncErr == nil {
+                    syncCtx.Queue().AddAfter(syncCtx.QueueKey(), after)
+                    return nil
+                }
+                err = syncErr
+            }
+
+            // Update operator status conditions (Degraded, Available, Progressing)
+            // ... (status update logic) ...
+
+            return err
+        }
+        ```
+    *   `manageInstallationPods` 方法 (在 `installer_controller.go` 中) 决定哪个节点需要更新 (`nodeToStartRevisionWith`)，检查是否需要等待 (`timeToWaitBeforeInstallingNextPod`)，然后可能为目标节点创建或管理一个 `installer` Pod (`ensureInstallerPod`)。它还会更新 `NodeStatus` 来反映安装进度或失败状态 (`newNodeStateForInstallInProgress`)。当 `NodeStatus` 中的 `TargetRevision` 被设置或更新时，这表示需要一个新的静态 Pod 版本。
+    *   `ensureInstallerPod` 函数负责创建实际的 `installer` Pod，该 Pod 会在目标节点上运行，并将新的静态 Pod 清单和相关资源写入节点的 `/etc/kubernetes/manifests/` 和 `/etc/kubernetes/static-pod-resources/` 目录。这里有一个惊奇的发现，`installer` pod直接写入本地硬盘文件，而不是走machine config operator下发。
+*   **Kubelet 行为**: Kubelet 对 `/etc/kubernetes/manifests/` 目录的监视和基于文件变化的 Pod 重启是 Kubernetes 的标准行为，不由 Operator 代码直接控制，而是 Kubelet 的内置功能。
+
+#### 5. Mermaid 流程图
+
+```mermaid
+flowchart TD
+    subgraph CertRotationController [CertRotationController in Operator Pod]
+        A[定时检查 KubeletClientCert] --> B{需要轮转?};
+        B -- Yes --> C[EnsureTargetCertKeyPair];
+        C --> D[生成新证书/密钥];
+        D --> E[更新 kubelet-client Secret（k8s API）];
+    end
+
+    subgraph InstallerController [InstallerController in Operator Pod]
+        F[监视 kubelet-client Secret] --> G{Secret 内容变化?};
+        G -- Yes --> H[创建新 Revision];
+        H --> I[更新各 Master 节点上的 /etc/kubernetes/manifests/kube-apiserver-pod.yaml];
+    end
+
+    subgraph Kubelet [Kubelet on Master Node]
+        J[监视 /etc/kubernetes/manifests/ 目录] --> K{kube-apiserver-pod.yaml 变化?};
+        K -- Yes --> L[读取新清单];
+        L --> M[终止旧 kube-apiserver Pod];
+        M --> N[启动新 kube-apiserver Pod（挂载新 Secret）];
+    end
+
+    E --> F;
+    I --> J;
+    N --> A;
+
+    style CertRotationController fill:#fff9c4,stroke:#333,stroke-width:2px;
+    style InstallerController fill:#ccf,stroke:#333,stroke-width:2px;
+    style Kubelet fill:#cfc,stroke:#333,stroke-width:2px;
+```
+
+#### 6. 总结
+
+`kubelet-client` 证书更新导致 `kube-apiserver` 重启是一个由 `cluster-kube-apiserver-operator` 精心编排的过程。`CertRotationController` 负责按计划更新 Secret 对象，而 `InstallerController` 则监视这些作为静态 Pod 输入的 Secret。一旦 Secret 发生变化，`InstallerController` 会驱动一个新的 Revision 的部署，通过更新节点上的静态 Pod 清单文件，最终由 Kubelet 执行 Pod 的重启，以确保 `kube-apiserver` 使用最新的配置和凭证。这个机制保证了证书在过期前得到更新，同时也确保了配置变更能够安全、自动地应用到关键的静态 Pod 上。
+
 ### 4.3 How kubelet Verifies kube-apiserver's Certificate
 
 The kubelet does not need to be redeployed to accept the new kube-apiserver certificate. This is because:
