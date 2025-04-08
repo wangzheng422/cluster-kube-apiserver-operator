@@ -31,13 +31,91 @@
 
 *   **证书检查与更新**:
     *   `vendor/github.com/openshift/library-go/pkg/operator/certrotation/client_cert_rotation_controller.go`: `CertRotationController.SyncWorker` 是入口点。
-    *   `vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go`: `RotatedSelfSignedCertKeySecret.EnsureTargetCertKeyPair` 负责检查轮转条件 (`needNewTargetCertKeyPairForTime`)、生成新证书 (`crypto.MakeSelfSignedCA`) 并更新 Secret (`v1helpers.ApplySecret`).
+        ```go
+        func (c CertRotationController) SyncWorker(ctx context.Context) error {
+            signingCertKeyPair, err := c.RotatedSigningCASecret.EnsureSigningCertKeyPair(ctx)
+            if err != nil {
+                return err
+            }
+
+            cabundleCerts, err := c.CABundleConfigMap.EnsureConfigMapCABundle(ctx, signingCertKeyPair)
+            if err != nil {
+                return err
+            }
+
+            // This calls EnsureTargetCertKeyPair below
+            if _, err := c.RotatedSelfSignedCertKeySecret.EnsureTargetCertKeyPair(ctx, signingCertKeyPair, cabundleCerts); err != nil {
+                return err
+            }
+
+            return nil
+        }
+        ```
+    *   `vendor/github.com/openshift/library-go/pkg/operator/certrotation/target.go`: `RotatedSelfSignedCertKeySecret.EnsureTargetCertKeyPair` 负责检查轮转条件 (`NeedNewTargetCertKeyPair`)、生成新证书 (`setTargetCertKeyPairSecret`) 并更新 Secret (`resourceapply.ApplySecret`).
+        ```go
+        func (c RotatedSelfSignedCertKeySecret) EnsureTargetCertKeyPair(ctx context.Context, signingCertKeyPair *crypto.CA, caBundleCerts []*x509.Certificate) (*corev1.Secret, error) {
+            // ... (error handling and secret retrieval/creation) ...
+
+            applyFn := resourceapply.ApplySecret // Or resourceapply.ApplySecretDoNotUse if UseSecretUpdateOnly is true
+            // ... (metadata update) ...
+
+            // Check if a new cert is needed
+            if reason := c.CertCreator.NeedNewTargetCertKeyPair(targetCertKeyPairSecret, signingCertKeyPair, caBundleCerts, c.Refresh, c.RefreshOnlyWhenExpired); len(reason) > 0 {
+                c.EventRecorder.Eventf("TargetUpdateRequired", "%q in %q requires a new target cert/key pair: %v", c.Name, c.Namespace, reason)
+                // Generate and set the new cert/key in the secret data
+                if err := setTargetCertKeyPairSecret(targetCertKeyPairSecret, c.Validity, signingCertKeyPair, c.CertCreator, c.AdditionalAnnotations); err != nil {
+                    return nil, err
+                }
+
+                LabelAsManagedSecret(targetCertKeyPairSecret, CertificateTypeTarget)
+
+                // Apply the updated secret to the API server
+                actualTargetCertKeyPairSecret, _, err := applyFn(ctx, c.Client, c.EventRecorder, targetCertKeyPairSecret)
+                if err != nil {
+                    return nil, err
+                }
+                targetCertKeyPairSecret = actualTargetCertKeyPairSecret
+            }
+
+            return targetCertKeyPairSecret, nil
+        }
+        ```
 *   **静态 Pod 更新触发**:
-    *   `vendor/github.com/openshift/library-go/pkg/operator/staticpod/controller/installer/installer_controller.go`: `InstallerController.sync` 是核心逻辑。
-    *   `sync` 方法会比较当前实际的 Pod 状态（通过 `podinformer` 获取）和期望的状态（基于输入资源如 `kubelet-client` Secret）。
-    *   如果检测到差异（例如 `kubelet-client` Secret 的 `ResourceVersion` 变化），它会调用 `createInstallerPod` 或类似逻辑来创建代表新 Revision 的 Pod（在 Operator 命名空间内，用于将新配置推送到节点）。
-    *   同时，它会更新 Operator 的状态，记录新的 `LatestAvailableRevision`。
-    *   `NodeState` 的更新会触发对节点上静态 Pod 清单文件的更新。
+    *   `vendor/github.com/openshift/library-go/pkg/operator/staticpod/controller/installer/installer_controller.go`: `InstallerController.Sync` 是核心逻辑入口。它检查所需资源是否存在，然后调用 `manageInstallationPods` 来处理安装流程。
+        ```go
+        func (c InstallerController) Sync(ctx context.Context, syncCtx factory.SyncContext) error {
+            operatorSpec, originalOperatorStatus, _, err := c.operatorClient.GetStaticPodOperatorState()
+            if err != nil {
+                return err
+            }
+            operatorStatus := originalOperatorStatus.DeepCopy()
+
+            if !management.IsOperatorManaged(operatorSpec.ManagementState) {
+                return nil
+            }
+
+            // Ensure ConfigMaps/Secrets for the target revision exist
+            err = c.ensureRequiredResourcesExist(ctx, originalOperatorStatus.LatestAvailableRevision)
+
+            // Only manage installation pods when all required resources are present.
+            if err == nil {
+                // This function handles the node-by-node rollout logic
+                requeue, after, syncErr := c.manageInstallationPods(ctx, operatorSpec, operatorStatus)
+                if requeue && syncErr == nil {
+                    syncCtx.Queue().AddAfter(syncCtx.QueueKey(), after)
+                    return nil
+                }
+                err = syncErr
+            }
+
+            // Update operator status conditions (Degraded, Available, Progressing)
+            // ... (status update logic) ...
+
+            return err
+        }
+        ```
+    *   `manageInstallationPods` 方法 (在 `installer_controller.go` 中) 决定哪个节点需要更新 (`nodeToStartRevisionWith`)，检查是否需要等待 (`timeToWaitBeforeInstallingNextPod`)，然后可能为目标节点创建或管理一个 `installer` Pod (`ensureInstallerPod`)。它还会更新 `NodeStatus` 来反映安装进度或失败状态 (`newNodeStateForInstallInProgress`)。当 `NodeStatus` 中的 `TargetRevision` 被设置或更新时，这表示需要一个新的静态 Pod 版本。
+    *   `ensureInstallerPod` 函数负责创建实际的 `installer` Pod，该 Pod 会在目标节点上运行，并将新的静态 Pod 清单和相关资源写入节点的 `/etc/kubernetes/manifests/` 和 `/etc/kubernetes/static-pod-resources/` 目录。
 *   **Kubelet 行为**: Kubelet 对 `/etc/kubernetes/manifests/` 目录的监视和基于文件变化的 Pod 重启是 Kubernetes 的标准行为，不由 Operator 代码直接控制，而是 Kubelet 的内置功能。
 
 ## 5. Mermaid 流程图
