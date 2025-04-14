@@ -6,17 +6,17 @@
 
 `kube-apiserver` 的证书轮换涉及几个关键的 Operator 和 Controller：
 
-1.  **Cluster Kube API Server Operator (CKAO):** 管理 `kube-apiserver` 静态 Pod 及其关联证书（服务证书、客户端证书如 kubelet-client、aggregator-client 等）。它利用 `library-go/operator/certrotation` 库进行基于时间的轮换。
-2.  **RevisionController (位于 CKAO/library-go 内):** 监控 `kube-apiserver` 静态 Pod 使用的 ConfigMap 和 Secret。当这些资源因证书轮换或配置更新而更改时，它会创建一个新版本 (revision) 并更新 `KubeAPIServer` 自定义资源 (CR) 的状态。
-3.  **Static Pod Controllers (位于 CKAO/library-go 内):** 检测 `KubeAPIServer` CR 状态中的版本变化 (`status.latestAvailableRevision`)。当版本变化时，它们负责将引用新版本资源的更新后的静态 Pod 清单 (manifest) 写入控制平面节点的 `/etc/kubernetes/manifests/kube-apiserver-pod.yaml` 文件。Kubelet 监控此文件，并在检测到更改时**重启** `kube-apiserver` 静态 Pod。不过，我们研究的场景，只是证书轮替，会更新`etc/kubernetes/static-pod-resources`下的对应证书文件，`kube-apiserver`会检测到证书文件更新，进而重新在应用层面加载证书，所以不会涉及kubelet重启`kube-apiserver`静态pod.
+1.  **Cluster Kube API Server Operator:** 管理 `kube-apiserver` 静态 Pod 及其关联证书（服务证书、客户端证书如 kubelet-client、aggregator-client 等）。它利用 `library-go/operator/certrotation` 库进行基于时间的轮换。
+2.  **RevisionController (位于 Cluster Kube API Server Operator/library-go 内):** 监控 `kube-apiserver` 静态 Pod 使用的 ConfigMap 和 Secret。当这些资源因证书轮换或配置更新而更改时，它会创建一个新版本 (revision) 并更新 `KubeAPIServer` 自定义资源 (CR) 的状态。
+3.  **Static Pod Controllers (位于 Cluster Kube API Server Operator/library-go 内):** 检测 `KubeAPIServer` CR 状态中的版本变化 (`status.latestAvailableRevision`)。当版本变化时，它们负责将引用新版本资源的更新后的静态 Pod 清单 (manifest) 写入控制平面节点的 `/etc/kubernetes/manifests/kube-apiserver-pod.yaml` 文件。Kubelet 监控此文件，并在检测到更改时**重启** `kube-apiserver` 静态 Pod。不过，我们研究的场景，只是证书轮替，会更新`etc/kubernetes/static-pod-resources`下的对应证书文件，`kube-apiserver`会检测到证书文件更新，进而重新在应用层面加载证书，所以不会涉及kubelet重启`kube-apiserver`静态pod.
 4.  **Machine Config Operator (MCO):** 监控集群范围的配置，包括由 Kubelet 用于验证 `kube-apiserver` 的 CA 包 (`kube-apiserver-to-kubelet-client-ca`)。当 CA 包更新时，MCO 会更新其内部的 `ControllerConfig` 自定义资源，并基于此生成新的 `MachineConfig` 对象，定义节点的目标状态。
 5.  **Machine Config Daemon (MCD):** 在每个节点上运行，应用 `MachineConfig` 更改。当检测到包含更新 CA 包的 `MachineConfig` 时，MCD 的 `certificate_writer` 会将新的 CA 数据写入节点文件系统（例如 `/etc/kubernetes/kubelet-ca.crt`）。虽然应用 `MachineConfig` 的标准流程**通常涉及节点驱逐 (draining) 和重启 (rebooting)**，以确保更改一致生效，这会间接导致 Kubelet 重启，但是对于文件`/etc/kubernetes/kubelet-ca.crt`的更新，`MachineConfig`直接将新的 CA 数据写入节点文件系统，kubelet能够检测到证书更新，并重新在应用层面加载新的 CA 包，而不需要节点驱逐或重启。
 
-## 证书轮换触发器和流程 (CKAO)
+## 证书轮换触发器和流程 (Cluster Kube API Server Operator)
 
-CKAO 管理 `kube-apiserver` 所需的各种证书的生命周期。
+Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书的生命周期。
 
-*   **触发器:** 轮换主要是基于时间的，在 CKAO 的 `certrotationcontroller` 中配置。每种证书类型（签名者或目标证书）都有定义的 `Validity` (有效期) 和 `Refresh` (刷新) 周期。当证书的年龄超过其 `Refresh` 持续时间时，轮换过程开始。
+*   **触发器:** 轮换主要是基于时间的，在 Cluster Kube API Server Operator 的 `certrotationcontroller` 中配置。每种证书类型（签名者或目标证书）都有定义的 `Validity` (有效期) 和 `Refresh` (刷新) 周期。当证书的年龄超过其 `Refresh` 持续时间时，轮换过程开始。
 
     ```go
     // pkg/operator/certrotationcontroller/certrotationcontroller.go
@@ -43,7 +43,9 @@ CKAO 管理 `kube-apiserver` 所需的各种证书的生命周期。
     5.  如果 *签名者* 证书本身被轮换，则相应的 CA 包 ConfigMap（例如 `openshift-kube-apiserver-operator` 中的 `kube-apiserver-to-kubelet-client-ca`）会被更新以包含新的 CA 证书。
 
 *   **存储:**
-    *   **签名者证书/密钥:** 存储在 CKAO 的命名空间 (`openshift-kube-apiserver-operator`) 内的 Secret 中，例如 `kube-apiserver-to-kubelet-signer`。
+    *   **签名者证书/密钥:** 存储在 Cluster Kube API Server Operator 的命名空间 (`openshift-kube-apiserver-operator`) 内的 Secret 中，例如 `kube-apiserver-to-kubelet-signer`。
+    *   **目标证书/密钥:** 存储在操作数 (operand) 的命名空间 (`openshift-kube-apiserver`) 内的 Secret 中，例如 `kubelet-client`, `localhost-serving-cert-certkey`。
+    *   **CA 包:** 存储在 ConfigMap 中，通常在 Cluster Kube API Server Operator 的命名空间 (`openshift
     *   **目标证书/密钥:** 存储在操作数 (operand) 的命名空间 (`openshift-kube-apiserver`) 内的 Secret 中，例如 `kubelet-client`, `localhost-serving-cert-certkey`。
     *   **CA 包:** 存储在 ConfigMap 中，通常在 CKAO 的命名空间 (`openshift-kube-apiserver-operator`) 或 `openshift-config-managed` 中，例如 `kube-apiserver-to-kubelet-client-ca`, `kube-apiserver-aggregator-client-ca`。
 
