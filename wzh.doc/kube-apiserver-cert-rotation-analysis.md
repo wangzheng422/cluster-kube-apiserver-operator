@@ -1,22 +1,22 @@
-# Kube-apiserver Certificate Rotation Analysis in OpenShift
+# Analysis of Kube-apiserver Certificate Rotation in OpenShift 4.16
 
-This document analyzes the process triggered when certificates related to the Kubernetes API server (`kube-apiserver`) are rotated in an OpenShift cluster. It details the components involved, storage locations, the role of the Machine Config Operator (MCO), and the restart behavior of `kube-apiserver` and `kubelet`.
+This document analyzes the processes triggered during certificate rotation related to the Kubernetes API server (`kube-apiserver`) in an OpenShift 4.16 cluster. It details the involved components, storage locations, the role of the Machine Config Operator (MCO), and the certificate update behavior of `kube-apiserver` and `kubelet`.
 
 ## Overview
 
-Certificate rotation for `kube-apiserver` involves several key operators and controllers:
+The certificate rotation for `kube-apiserver` involves several key Operators and Controllers:
 
-1.  **Cluster Kube API Server Operator (CKAO):** Manages the `kube-apiserver` static pods and their associated certificates (serving certs, client certs like kubelet-client, aggregator-client, etc.). It utilizes the `library-go/operator/certrotation` library for time-based rotation.
-2.  **RevisionController (within CKAO/library-go):** Monitors the ConfigMaps and Secrets used by the `kube-apiserver` static pod. When these resources change (due to certificate rotation or configuration updates), it creates a new revision and updates the `KubeAPIServer` Custom Resource (CR) status.
-3.  **Static Pod Controllers (within CKAO/library-go):** Detect the revision change in the `KubeAPIServer` CR status and roll out a new static pod manifest to control plane nodes, triggering a `kube-apiserver` restart by the Kubelet.
-4.  **Machine Config Operator (MCO):** Monitors certain cluster-wide configurations, including CA bundles like the one Kubelet uses to verify the `kube-apiserver` (`kube-apiserver-to-kubelet-client-ca`). It generates `MachineConfig` objects reflecting the desired node state.
-5.  **Machine Config Daemon (MCD):** Runs on each node, applies `MachineConfig` changes, including writing updated CA bundles to the node's filesystem. Applying significant changes often involves node draining and rebooting.
+1.  **Cluster Kube API Server Operator:** Manages the `kube-apiserver` static Pod and its associated certificates (serving certs, client certs like kubelet-client, aggregator-client, etc.). It utilizes the `library-go/operator/certrotation` library for time-based rotation.
+2.  **RevisionController (within Cluster Kube API Server Operator/library-go):** Monitors ConfigMaps and Secrets used by the `kube-apiserver` static Pod. When these resources change due to certificate rotation or configuration updates, it creates a new revision and updates the status of the `KubeAPIServer` Custom Resource (CR).
+3.  **Static Pod Controllers (within Cluster Kube API Server Operator/library-go):** Detect revision changes in the `KubeAPIServer` CR status (`status.latestAvailableRevision`). When a revision changes, they are responsible for writing the updated static Pod manifest, referencing the new revision's resources, to the `/etc/kubernetes/manifests/kube-apiserver-pod.yaml` file on control plane nodes. The Kubelet monitors this file and **restarts** the `kube-apiserver` static Pod upon detecting changes. However, in the scenario we are studying, which is just certificate rotation, the corresponding certificate files under `/etc/kubernetes/static-pod-resources` are updated. The `kube-apiserver` detects the certificate file updates and reloads the certificates at the application level, so it does not involve the Kubelet restarting the `kube-apiserver` static pod.
+4.  **Machine Config Operator (MCO):** Monitors cluster-wide configurations, including the CA bundle (`kube-apiserver-to-kubelet-client-ca`) used by Kubelet to verify the `kube-apiserver`. When the CA bundle is updated, MCO updates its internal `ControllerConfig` Custom Resource and generates new `MachineConfig` objects based on it, defining the target state for nodes.
+5.  **Machine Config Daemon (MCD):** Runs on each node, applying `MachineConfig` changes. When it detects a `MachineConfig` containing an updated CA bundle, the MCD's `certificate_writer` writes the new CA data to the node's filesystem (e.g., `/etc/kubernetes/kubelet-ca.crt`). While the standard process for applying a `MachineConfig` **typically involves node draining and rebooting** to ensure changes take effect consistently, which indirectly causes Kubelet to restart, the update for the `/etc/kubernetes/kubelet-ca.crt` file involves the `MachineConfig` directly writing the new CA data to the node filesystem. The Kubelet can detect the certificate update and reload the new CA bundle at the application level without requiring node draining or rebooting.
 
-## Certificate Rotation Trigger and Process (CKAO)
+## Certificate Rotation Triggers and Flow (Cluster Kube API Server Operator)
 
-CKAO manages the lifecycle of various certificates required by `kube-apiserver`.
+The Cluster Kube API Server Operator manages the lifecycle of various certificates required by the `kube-apiserver`.
 
-*   **Trigger:** Rotation is primarily time-based, configured within CKAO's `certrotationcontroller`. Each certificate type (signer or target) has defined `Validity` and `Refresh` periods. The rotation process begins when the certificate's age exceeds its `Refresh` duration.
+*   **Trigger:** Rotation is primarily time-based, configured within the Cluster Kube API Server Operator's `certrotationcontroller`. Each certificate type (signer or target) has a defined `Validity` and `Refresh` period. The rotation process begins when a certificate's age exceeds its `Refresh` duration.
 
     ```go
     // pkg/operator/certrotationcontroller/certrotationcontroller.go
@@ -35,42 +35,40 @@ CKAO manages the lifecycle of various certificates required by `kube-apiserver`.
     },
     ```
 
-*   **Process:** The `library-go/pkg/operator/certrotation` logic handles the actual rotation:
-    1.  It checks if the current target certificate needs refreshing based on its issuance date and the configured `Refresh` period.
-    2.  If refresh is needed, it ensures the corresponding *signer* certificate (defined in `RotatedSigningCASecret`) is valid and loaded.
-    3.  It generates a new private key and certificate signing request (CSR) based on the `CertCreator` configuration (e.g., `ClientRotation`, `ServingRotation`).
-    4.  It uses the signer certificate and key to sign the CSR, creating the new target certificate.
-    5.  The new key and certificate are saved into the target Secret (e.g., `kubelet-client` in `openshift-kube-apiserver` namespace).
-    6.  If the *signer* certificate itself is rotated, the corresponding CA bundle ConfigMap (e.g., `kube-apiserver-to-kubelet-client-ca` in `openshift-kube-apiserver-operator`) is updated to include the new CA certificate.
+*   **Flow:** The `library-go/pkg/operator/certrotation` logic handles the actual rotation:
+    1.  Checks if the current target certificate needs refreshing based on its issuance date and the configured `Refresh` period.
+    2.  If refresh is needed, ensures the corresponding *signer* certificate (defined in `RotatedSigningCASecret`) is valid and loaded.
+    3.  Creates a new target certificate by signing a CSR using the signer certificate and key, based on the `CertCreator`.
+    4.  Saves the new key and certificate into the target Secret (e.g., `kubelet-client` in the `openshift-kube-apiserver` namespace).
+    5.  If the *signer* certificate itself is rotated, the corresponding CA bundle ConfigMap (e.g., `kube-apiserver-to-kubelet-client-ca` in `openshift-kube-apiserver-operator`) is updated to include the new CA certificate.
 
 *   **Storage:**
-    *   **Signer Certificates/Keys:** Stored in Secrets within the CKAO's namespace (`openshift-kube-apiserver-operator`), e.g., `kube-apiserver-to-kubelet-signer`.
-    *   **Target Certificates/Keys:** Stored in Secrets within the operand's namespace (`openshift-kube-apiserver`), e.g., `kubelet-client`, `localhost-serving-cert-certkey`.
-    *   **CA Bundles:** Stored in ConfigMaps, often in the CKAO's namespace (`openshift-kube-apiserver-operator`) or `openshift-config-managed`, e.g., `kube-apiserver-to-kubelet-client-ca`, `kube-apiserver-aggregator-client-ca`.
+    *   **Signer Certs/Keys:** Stored in Secrets within the Cluster Kube API Server Operator's namespace (`openshift-kube-apiserver-operator`), e.g., `kube-apiserver-to-kubelet-signer`.
+    *   **Target Certs/Keys:** Stored in Secrets within the operand's namespace (`openshift-kube-apiserver`), e.g., `kubelet-client`, `localhost-serving-cert-certkey`.
+    *   **CA Bundles:** Stored in ConfigMaps, typically in the Cluster Kube API Server Operator's namespace (`openshift-kube-apiserver-operator`) or `openshift-config-managed`, e.g., `kube-apiserver-to-kubelet-client-ca`, `kube-apiserver-aggregator-client-ca`.
 
-## Kube-apiserver Restart Process (CKAO)
+## Kube-apiserver Restart Flow (Cluster Kube API Server Operator)
 
-When a certificate used directly by the `kube-apiserver` static pod is rotated (updated in its Secret), the `RevisionController` triggers a restart.
+When certificates directly used by the `kube-apiserver` static Pod are rotated (updated in their Secrets), the `RevisionController` triggers a restart.
 
-*   **Trigger:** A change detected in any of the ConfigMaps or Secrets monitored by the `RevisionController`. This includes secrets containing rotated certificates like `kubelet-client`, `localhost-serving-cert-certkey`, `aggregator-client`, etc.
+*   **Trigger:** A change detected in any ConfigMap or Secret monitored by the `RevisionController`. This includes Secrets containing rotated certificates like `kubelet-client`, `localhost-serving-cert-certkey`, `aggregator-client`, etc.
 
-*   **Process:**
+*   **Flow:**
     1.  The `RevisionController.sync` loop calls `isLatestRevisionCurrent`.
-    2.  `isLatestRevisionCurrent` compares the data in the base Secrets/ConfigMaps (e.g., `secrets/kubelet-client`) against the data in the latest revisioned copies (e.g., `secrets/kubelet-client-3`). If the certificate rotation updated the base secret, a difference is detected.
-    3.  `createRevisionIfNeeded` is called, which determines a new revision number (`nextRevision = latestAvailableRevision + 1`).
-    4.  `createNewRevision` copies the *current* content from the base Secrets/ConfigMaps into new Secrets/ConfigMaps suffixed with `nextRevision` (e.g., `secrets/kubelet-client-4`).
-    5.  Crucially, `createRevisionIfNeeded` updates the `status.latestAvailableRevision` field in the `KubeAPIServer` CR via the `operatorClient.UpdateLatestRevisionOperatorStatus` call.
-    6.  Other controllers within CKAO (part of the static pod management framework, like `InstallerController`, `NodeController`) monitor the `KubeAPIServer` CR. They detect the change in `status.latestAvailableRevision`.
-    7.  The `InstallerController` (likely) generates a new `kube-apiserver` static pod manifest (`pod.yaml`) that references the `nextRevision`. This manifest, along with other revisioned resources, is placed into a revision-specific ConfigMap (e.g., `kube-apiserver-pod-4`).
-    8.  The `NodeController` ensures this ConfigMap is mounted into the correct directory (`/etc/kubernetes/static-pod-resources/kube-apiserver-pod-<revision>`) on each control plane node, and updates the static pod manifest file (`/etc/kubernetes/manifests/kube-apiserver-pod.yaml`) to point to the new revision's manifest.
-    9.  The Kubelet on the control plane node watches the `/etc/kubernetes/manifests` directory. Upon detecting the change in `kube-apiserver-pod.yaml`, it gracefully stops the old `kube-apiserver` static pod and starts a new one based on the updated manifest, which uses the newly revisioned Secrets/ConfigMaps containing the rotated certificates.
+    2.  `isLatestRevisionCurrent` compares data from the base Secrets/ConfigMaps (e.g., `secrets/kubelet-client`) with data in the latest versioned copies (e.g., `secrets/kubelet-client-3`). If certificate rotation updated the base Secret, a difference is detected.
+    3.  `createRevisionIfNeeded` is called, determining a new revision number (`nextRevision = latestAvailableRevision + 1`).
+    4.  `createNewRevision` copies the *current* content of the base Secrets/ConfigMaps into new Secrets/ConfigMaps suffixed with `nextRevision` (e.g., `secrets/kubelet-client-4`).
+    5.  Key Step: `createRevisionIfNeeded` updates the `status.latestAvailableRevision` field in the `KubeAPIServer` CR via an `operatorClient.UpdateLatestRevisionOperatorStatus` call.
+    6.  Other controllers within the Cluster Kube API Server Operator (part of the static pod management framework, like `InstallerController`, `NodeController`) monitor the `KubeAPIServer` CR. They detect the change in `status.latestAvailableRevision`.
+    7.  The `InstallerController` (likely) generates a new `kube-apiserver` static Pod manifest (`pod.yaml`) that references `nextRevision`. This manifest, along with other versioned resources, is placed into a revision-specific ConfigMap (e.g., `kube-apiserver-pod-4`).
+    8.  The `NodeController` ensures this ConfigMap is mounted into the correct directory on each control plane node (`/etc/kubernetes/static-pod-resources/kube-apiserver-pod-<revision>`) and updates the static Pod manifest file (`/etc/kubernetes/manifests/kube-apiserver-pod.yaml`) to point to the new revision's manifest.
+    9.  The Kubelet on the control plane node monitors the `/etc/kubernetes/manifests` directory. Upon detecting the change in `kube-apiserver-pod.yaml`, it gracefully stops the old `kube-apiserver` static Pod and starts a new one based on the updated manifest, which uses the new versioned Secrets/ConfigMaps containing the rotated certificates.
 
 *   **Code Snippet (Revision Trigger):**
-
     ```go
     // vendor/github.com/openshift/library-go/pkg/operator/revisioncontroller/revision_controller.go
 
-    // isLatestRevisionCurrent compares base resources with the latest revisioned copies.
+    // isLatestRevisionCurrent compares base resources with the latest versioned copies.
     func (c RevisionController) isLatestRevisionCurrent(ctx context.Context, revision int32) (bool, bool, string) {
         // ... comparison logic for configmaps and secrets ...
         if !equality.Semantic.DeepEqual(existingData, requiredData) {
@@ -85,19 +83,19 @@ When a certificate used directly by the `kube-apiserver` static pod is rotated (
     func (c RevisionController) createRevisionIfNeeded(ctx context.Context, recorder events.Recorder, latestAvailableRevision int32, resourceVersion string) (bool, error) {
         isLatestRevisionCurrent, requiredIsNotFound, reason := c.isLatestRevisionCurrent(ctx, latestAvailableRevision)
         if isLatestRevisionCurrent {
-            return false, nil // No changes
+            return false, nil // No change
         }
 
         nextRevision := latestAvailableRevision + 1
         // ... check required resources ...
 
-        // Create new revisioned copies of resources
+        // Create new versioned resource copies
         createdNewRevision, err := c.createNewRevision(ctx, recorder, nextRevision, reason)
         // ... error handling ...
 
         if !createdNewRevision { return false, nil }
 
-        // *** KEY STEP: Update operator status with the new revision number ***
+        // *** Key Step: Update Operator status with the new revision number ***
         cond := operatorv1.OperatorCondition{ /* ... */ }
         if _, updated, updateError := c.operatorClient.UpdateLatestRevisionOperatorStatus(ctx, nextRevision, v1helpers.UpdateConditionFn(cond)); updateError != nil {
             return true, updateError
@@ -110,22 +108,19 @@ When a certificate used directly by the `kube-apiserver` static pod is rotated (
 
 ## CA Bundle Distribution (MCO/MCD)
 
-When a CA bundle used by components outside the static pod (like Kubelet) is updated, MCO and MCD handle its distribution to nodes. The primary example is the CA bundle Kubelet uses to verify the `kube-apiserver`'s serving certificate.
+When a CA bundle used by components external to the static Pod (like Kubelet) is updated, MCO and MCD handle its distribution to nodes. The primary example is the CA bundle used by Kubelet to verify the `kube-apiserver` serving certificate.
 
-*   **Trigger:** CKAO's `CertRotationController` updates a CA bundle ConfigMap (e.g., `kube-apiserver-to-kubelet-client-ca` in `openshift-kube-apiserver-operator`) when the corresponding *signer* certificate rotates.
+*   **Trigger:** The Cluster Kube API Server Operator's `CertRotationController` updates the CA bundle ConfigMap (e.g., `kube-apiserver-to-kubelet-client-ca` in `openshift-kube-apiserver-operator`) when the corresponding *signer* certificate is rotated.
 *   **Components:** MCO Controller, MCD (Machine Config Daemon).
-*   **Process:**
+*   **Flow:**
     1.  The MCO controller (`pkg/operator/sync.go`) watches relevant ConfigMaps, including `kube-apiserver-to-kubelet-client-ca`.
     2.  Upon detecting a change, it reads the updated CA bundle data (`ca-bundle.crt`).
-    3.  This data (`kubeAPIServerServingCABytes`) is stored within the MCO's internal `ControllerConfig` CR spec (`spec.KubeAPIServerServingCAData`).
-    4.  MCO renders new `MachineConfig` objects for the relevant pools (e.g., `master`, `worker`). These `MachineConfigs` define the desired state of files on the nodes, including the target path for the Kubelet CA bundle, populated with the data from `spec.KubeAPIServerServingCAData`.
+    3.  This data (`kubeAPIServerServingCABytes`) is stored in the MCO's internal `ControllerConfig` CR spec (`spec.KubeAPIServerServingCAData`).
+    4.  MCO renders new `MachineConfig` objects for the relevant pools (e.g., `master`, `worker`). These `MachineConfigs` define the desired state of files on the node, including the target path for the Kubelet CA bundle, populated with the data from `spec.KubeAPIServerServingCAData`.
     5.  The MCD running on each node detects that a new `MachineConfig` is available for it.
-    6.  MCD's `certificate_writer.go` specifically handles writing the CA data from the applied `ControllerConfig`'s `Spec.KubeAPIServerServingCAData` to the designated path on the node's filesystem.
-
-*   **Storage:** The CA bundle is written to the node filesystem by MCD. The typical path used by Kubelet for its `--client-ca-file` argument (or corresponding KubeletConfiguration field `clientCAFile`) is `/etc/kubernetes/kubelet-ca.crt`.
-
+    6.  The MCD's `certificate_writer.go` specifically handles writing the CA data from the applied `ControllerConfig`'s `Spec.KubeAPIServerServingCAData` to the specified path on the node's filesystem.
+*   **Storage:** The CA bundle is written to the node filesystem by MCD. The typical path used by Kubelet's `--client-ca-file` argument (or corresponding KubeletConfiguration field `clientCAFile`) is `/etc/kubernetes/kubelet-ca.crt`.
 *   **Code Snippets:**
-
     ```go
     // pkg/operator/sync.go - MCO reads the CA bundle ConfigMap
     func (optr *Operator) sync(ctx context.Context, syncCtx factory.SyncContext) error {
@@ -160,75 +155,64 @@ When a CA bundle used by components outside the static pod (like Kubelet) is upd
     }
     ```
 
-## Kubelet Restart Process
+## Kubelet and CA Bundle Updates
 
-Whether Kubelet restarts *directly* due to a CA bundle update is nuanced.
+When the `kube-apiserver-to-kubelet-client-ca` CA bundle is updated, Kubelet's behavior needs to distinguish between the capabilities of the Kubelet process itself and the standard operating procedures of MCO/MCD.
 
-*   **Trigger:** MCD applying a new `MachineConfig` to the node. This `MachineConfig` might contain the updated `/etc/kubernetes/kubelet-ca.crt` file content, or other changes to Kubelet's configuration or related system files.
-*   **Process:**
-    1.  Kubelet is generally capable of reloading TLS assets like the `clientCAFile` without a full service restart. It periodically checks for file changes or can be triggered to reload.
-    2.  However, the standard mechanism for applying `MachineConfig` changes via MCD, especially for core components or critical file paths, involves a coordinated node update process.
-    3.  MCD typically **drains** the node (evicting pods) and then **reboots** the node to ensure all changes are applied cleanly and consistently. This reboot inherently restarts the Kubelet service along with the entire node OS.
-    4.  While the MCD code (`pkg/daemon/certificate_writer.go`) contains logic mentioning `"Skipping kubelet restart"`, this likely applies to specific, non-disruptive scenarios or might be related to deferring restarts during complex updates. The default and safest mechanism for applying the `MachineConfig` change containing the new CA bundle is a node reboot orchestrated by MCD.
+*   **Trigger:** MCD applies a new `MachineConfig` containing the updated CA bundle data to the node. The MCD's `certificate_writer` writes the new CA bundle content to the file path specified in the Kubelet configuration (e.g., `/etc/kubernetes/kubelet-ca.crt`).
 
-*   **Conclusion on Kubelet Restart:** A Kubelet *service* restart (`systemctl restart kubelet`) is **not directly triggered** by CKAO rotating the `kube-apiserver-to-kubelet-client-ca`. Instead, the update is delivered via a `MachineConfig`, and the application of this `MachineConfig` by MCD **typically results in a node reboot**, which indirectly restarts Kubelet. The Kubelet process itself likely reloads the updated CA file content without requiring a service restart if only the file content changes, but the MCO/MCD update mechanism usually involves a reboot for such changes.
+*   **Flow and Behavior:**
+    1.  **Kubelet File Monitoring:** The Kubelet process itself is designed to monitor changes to the certificate files it uses (including the one specified by `--client-ca-file`). Theoretically, when the file content is updated, Kubelet *can* reload this CA bundle without restarting its service process.
+    2.  **MCO/MCD Standard Operation:** However, in OpenShift, updates to such CA bundles are managed via MCO and MCD. MCO generates the `MachineConfig`, and MCD is responsible for applying it. The standard, default, and safest method for applying a `MachineConfig` (especially for changes involving core system files or configurations) is to perform a coordinated node update, which **typically includes draining the node and then rebooting it**.
+    3.  **CA Special Handling:** There is special handling for `kubelet-ca.crt` within `certificate_writer.go` that specifically deals with writing the certificate file. This bypasses the standard MCO/MCD update flow, thus skipping the reboot or `systemd` update steps.
+
+*   **Conclusion on Kubelet Update:** The Kubelet service does not restart. The update of the CA bundle file on disk **triggers** a reload of the certificate. The Kubelet process itself has the capability to reload the file. However, the distribution of the CA update is handled by the MCO/MCD mechanism.
 
 ## Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    participant CKAO_CertRotationController as CKAO CertRotationController
-    participant CKAO_RevisionController as CKAO RevisionController
-    participant KubeAPIServer_CR as KubeAPIServer CR
-    participant Kubelet_CP_Node as Kubelet (CP Node)
-    participant Kube_apiserver_Pod as Kube-apiserver Pod
-    participant MCO_Controller as MCO Controller
-    participant ControllerConfig_CR as ControllerConfig CR
-    participant MachineConfig_CR as MachineConfig CR
-    participant MCD_Node as MCD (Node)
-    participant Kubelet_Worker_Node as Kubelet (Worker Node)
+    participant ClusterKubeAPIServerOperator_CertRot as Cluster Kube API Server Operator CertRotationController
+    participant ClusterKubeAPIServerOperator_RevCon as Cluster Kube API Server Operator RevisionController
+    participant ClusterKubeAPIServerOperator_NodeCon as Cluster Kube API Server Operator NodeController
+    participant K8s_API as Kubernetes API
+    participant MCO as Machine Config Operator
+    participant Kubelet_CP as Kubelet (Control Plane)
+    participant APIServer_Pod as Kube-apiserver Pod
+    participant MCD as Machine Config Daemon (Node)
+    participant Kubelet_Node as Kubelet (Node)
 
-    Note over CKAO_CertRotationController: Time-based refresh interval reached for cert X (e.g., kubelet-client)
-    CKAO_CertRotationController->>CKAO_CertRotationController: Generate new key/cert for X
-    CKAO_CertRotationController->>Secret_X: Update with new key/cert
+    Note over ClusterKubeAPIServerOperator_CertRot, APIServer_Pod: Scenario 1: Target Certificate Rotation (e.g., kubelet-client)
 
-    Note over CKAO_RevisionController: Monitors Secret (X)
-    CKAO_RevisionController->>Secret_X: Detects change
-    CKAO_RevisionController->>CKAO_RevisionController: Calculate nextRevision (N+1)
-    CKAO_RevisionController->>Secrets_ConfigMaps_Revision: Create copies with updated content
-    CKAO_RevisionController->>KubeAPIServer_CR: Update status.latestAvailableRevision = N+1
+    ClusterKubeAPIServerOperator_CertRot->>K8s_API: 1. Generate new cert/key, Update Target Secret (e.g., openshift-kube-apiserver/kubelet-client)
+    ClusterKubeAPIServerOperator_RevCon->>K8s_API: 2. Watch Secret, detect change
+    ClusterKubeAPIServerOperator_RevCon->>K8s_API: 3. Create new Versioned Secret (e.g., openshift-kube-apiserver/kubelet-client-5)
+    ClusterKubeAPIServerOperator_RevCon->>K8s_API: 4. Update KubeAPIServer CR status.latestAvailableRevision = 5
+    ClusterKubeAPIServerOperator_NodeCon->>K8s_API: 5. Watch KubeAPIServer CR, detect revision change
+    ClusterKubeAPIServerOperator_NodeCon->>Kubelet_CP: 6. Write updated manifest (/etc/kubernetes/manifests/kube-apiserver-pod.yaml) referencing revision 5 resources
+    Kubelet_CP->>Kubelet_CP: 7. Detect manifest file change
+    Kubelet_CP->>APIServer_Pod: 8. Stop old Pod (rev 4)
+    Kubelet_CP->>APIServer_Pod: 9. Start new Pod (rev 5) using new versioned Secret
 
-    Note over CKAO_StaticPod_Controllers: Monitor KubeAPIServer CR status
-    CKAO_StaticPod_Controllers->>KubeAPIServer_CR: Detect change in latestAvailableRevision
-    CKAO_StaticPod_Controllers->>ConfigMap_Pod_Manifest: Generate new manifest referencing revision N+1
-    CKAO_StaticPod_Controllers->>Kubelet_CP_Node: Update /etc/kubernetes/manifests/kube-apiserver-pod.yaml
+    Note over ClusterKubeAPIServerOperator_CertRot, Kubelet_Node: Scenario 2: Signer Certificate Rotation (e.g., kube-apiserver-to-kubelet-signer)
 
-    Kubelet_CP_Node->>Kubelet_CP_Node: Detect manifest change
-    Kubelet_CP_Node->>Kube_apiserver_Pod_RevN: Stop Pod
-    Kubelet_CP_Node->>Kube_apiserver_Pod_RevN1: Start Pod with new certs
-
-    alt Signer Cert Rotated (e.g., kube-apiserver-to-kubelet-signer)
-        CKAO_CertRotationController->>ConfigMap_CA_Bundle: Update CA Bundle (e.g., kube-apiserver-to-kubelet-client-ca)
-
-        Note over MCO_Controller: Monitors CA Bundle ConfigMap
-        MCO_Controller->>ConfigMap_CA_Bundle: Detects change
-        MCO_Controller->>MCO_Controller: Read updated CA data
-        MCO_Controller->>ControllerConfig_CR: Update spec.kubeAPIServerServingCAData
-        MCO_Controller->>MachineConfig_CR: Generate/Update MachineConfig with new file content for /etc/kubernetes/kubelet-ca.crt
-
-        Note over MCD_Node: Monitors assigned MachineConfig
-        MCD_Node->>MachineConfig_CR: Detects new desired config
-        MCD_Node->>Node_Filesystem: Write updated /etc/kubernetes/kubelet-ca.crt
-        MCD_Node->>MCD_Node: Initiate Node Drain & Reboot (Typical)
-        Note right of Kubelet_Worker_Node: Node reboots, Kubelet starts with new CA
-    end
+    ClusterKubeAPIServerOperator_CertRot->>K8s_API: 1a. Rotate signer cert/key, Update Signer Secret (e.g., openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-signer)
+    ClusterKubeAPIServerOperator_CertRot->>K8s_API: 1b. Update CA Bundle ConfigMap (e.g., openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-client-ca)
+    MCO->>K8s_API: 2. Watch CA Bundle CM, detect change
+    MCO->>K8s_API: 3. Update ControllerConfig CR spec.kubeAPIServerServingCAData
+    MCO->>K8s_API: 4. Render & Apply new MachineConfig for relevant pool (master/worker)
+    MCD->>K8s_API: 5. Watch MachineConfig, detect new config for its node
+    MCD->>MCD: 6. Read CA data from ControllerConfig (via K8s API)
+    MCD->>MCD: 7. Write updated CA file to node disk (e.g., /etc/kubernetes/kubelet-ca.crt) (Bypasses standard node update)
+    Kubelet_Node->>Kubelet_Node: 8. Detect CA file change (/etc/kubernetes/kubelet-ca.crt)
+    Kubelet_Node->>Kubelet_Node: 9. Reload CA bundle dynamically (No Kubelet Restart)
 
 ```
 
 ## Summary
 
-*   **Certificate Rotation Trigger:** Time-based refresh intervals configured in CKAO.
-*   **Components:** CKAO (`CertRotationController`, `RevisionController`, Static Pod Controllers), MCO, MCD, Kubelet.
-*   **Certificate Storage:** Secrets and ConfigMaps in `openshift-kube-apiserver-operator` and `openshift-kube-apiserver` namespaces. CA bundles also written to `/etc/kubernetes/kubelet-ca.crt` on nodes by MCD.
-*   **Kube-apiserver Restart:** Triggered by CKAO's `RevisionController` detecting changes in dependent Secrets/ConfigMaps (including rotated certificates). CKAO updates the `KubeAPIServer` CR status (`latestAvailableRevision`), leading to a static pod rollout managed by Kubelet on control plane nodes.
-*   **Kubelet Restart:** Not directly triggered by CA bundle rotation. The MCO detects the updated CA bundle ConfigMap, generates a new `MachineConfig`, and the MCD applies this change to the node. Applying the `MachineConfig` typically involves a node drain and **reboot**, which restarts Kubelet indirectly.
+*   **Certificate Rotation Trigger:** Time-based refresh interval configured in the Cluster Kube API Server Operator.
+*   **Components:** Cluster Kube API Server Operator (`CertRotationController`, `RevisionController`, Static Pod Controllers), MCO, MCD, Kubelet.
+*   **Certificate Storage:** Secrets and ConfigMaps in the `openshift-kube-apiserver-operator` and `openshift-kube-apiserver` namespaces. The CA bundle is also written to `/etc/kubernetes/kubelet-ca.crt` on nodes by MCD.
+*   **Kube-apiserver Restart:** **Restarts occur**. Triggered when the Cluster Kube API Server Operator's `RevisionController` detects changes in its dependent Secrets/ConfigMaps (e.g., the rotated target certificate `kubelet-client`). The Cluster Kube API Server Operator updates the `KubeAPIServer` CR status (`status.latestAvailableRevision`), the `Static Pod Controller` (like `NodeController`) detects this change and updates the static Pod manifest (`/etc/kubernetes/manifests/kube-apiserver-pod.yaml`) on control plane nodes to reference the new versioned resources. Kubelet monitors this manifest file change and **restarts** the `kube-apiserver` Pod. (Note: The overview section mentioned the apiserver might only reload certificates, but the detailed restart flow describes the restart mechanism based on revision changes. This summary follows the detailed flow description).
+*   **Kubelet Restart:** **Does not restart**. When the CA bundle (`kube-apiserver-to-kubelet-client-ca`) is updated, MCO detects the change and generates a new `MachineConfig`. MCD writes the new CA file to the node (`/etc/kubernetes/kubelet-ca.crt`). Due to special handling logic for this CA file in MCD (`certificate_writer`), it writes the file directly **without triggering the standard node drain and reboot process**. Kubelet monitors the CA file for changes and dynamically **reloads** the CA bundle; the service process itself does not restart.
