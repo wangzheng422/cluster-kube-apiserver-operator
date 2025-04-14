@@ -1,6 +1,6 @@
 # Kube APIServer Operator 证书轮替逻辑
 
-本文档梳理了 `cluster-kube-apiserver-operator` 中证书轮替的核心逻辑，特别是与 Machine Config Operator (MCO) 的联动机制。
+本文档梳理了 [`cluster-kube-apiserver-operator`](https://github.com/openshift/cluster-kube-apiserver-operator/tree/release-4.12) 中证书轮替的核心逻辑，特别是与 [Machine Config Operator (MCO)](https://github.com/openshift/machine-config-operator/tree/release-4.12) 的联动机制。
 
 ## 核心组件
 
