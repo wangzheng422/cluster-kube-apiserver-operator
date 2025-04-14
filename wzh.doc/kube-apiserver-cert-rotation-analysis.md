@@ -177,50 +177,50 @@ Whether Kubelet restarts *directly* due to a CA bundle update is nuanced.
 
 ```mermaid
 sequenceDiagram
-    participant CKAO CertRotationController
-    participant CKAO RevisionController
-    participant KubeAPIServer CR
-    participant Kubelet (CP Node)
-    participant Kube-apiserver Pod
-    participant MCO Controller
-    participant ControllerConfig CR
-    participant MachineConfig CR
-    participant MCD (Node)
-    participant Kubelet (Worker Node)
+    participant CKAO_CertRotationController as CKAO CertRotationController
+    participant CKAO_RevisionController as CKAO RevisionController
+    participant KubeAPIServer_CR as KubeAPIServer CR
+    participant Kubelet_CP_Node as Kubelet (CP Node)
+    participant Kube_apiserver_Pod as Kube-apiserver Pod
+    participant MCO_Controller as MCO Controller
+    participant ControllerConfig_CR as ControllerConfig CR
+    participant MachineConfig_CR as MachineConfig CR
+    participant MCD_Node as MCD (Node)
+    participant Kubelet_Worker_Node as Kubelet (Worker Node)
 
-    Note over CKAO CertRotationController: Time-based refresh interval reached for cert X (e.g., kubelet-client)
-    CKAO CertRotationController->>CKAO CertRotationController: Generate new key/cert for X
-    CKAO CertRotationController->>Secret (X): Update with new key/cert
+    Note over CKAO_CertRotationController: Time-based refresh interval reached for cert X (e.g., kubelet-client)
+    CKAO_CertRotationController->>CKAO_CertRotationController: Generate new key/cert for X
+    CKAO_CertRotationController->>Secret_X: Update with new key/cert
 
-    Note over CKAO RevisionController: Monitors Secret (X)
-    CKAO RevisionController->>Secret (X): Detects change
-    CKAO RevisionController->>CKAO RevisionController: Calculate nextRevision (N+1)
-    CKAO RevisionController->>Secrets/ConfigMaps (Revision N+1): Create copies with updated content
-    CKAO RevisionController->>KubeAPIServer CR: Update status.latestAvailableRevision = N+1
+    Note over CKAO_RevisionController: Monitors Secret (X)
+    CKAO_RevisionController->>Secret_X: Detects change
+    CKAO_RevisionController->>CKAO_RevisionController: Calculate nextRevision (N+1)
+    CKAO_RevisionController->>Secrets_ConfigMaps_Revision: Create copies with updated content
+    CKAO_RevisionController->>KubeAPIServer_CR: Update status.latestAvailableRevision = N+1
 
-    Note over CKAO StaticPod Controllers: Monitor KubeAPIServer CR status
-    CKAO StaticPod Controllers->>KubeAPIServer CR: Detect change in latestAvailableRevision
-    CKAO StaticPod Controllers->>ConfigMap (Pod Manifest N+1): Generate new manifest referencing revision N+1
-    CKAO StaticPod Controllers->>Kubelet (CP Node): Update /etc/kubernetes/manifests/kube-apiserver-pod.yaml
+    Note over CKAO_StaticPod_Controllers: Monitor KubeAPIServer CR status
+    CKAO_StaticPod_Controllers->>KubeAPIServer_CR: Detect change in latestAvailableRevision
+    CKAO_StaticPod_Controllers->>ConfigMap_Pod_Manifest: Generate new manifest referencing revision N+1
+    CKAO_StaticPod_Controllers->>Kubelet_CP_Node: Update /etc/kubernetes/manifests/kube-apiserver-pod.yaml
 
-    Kubelet (CP Node)->>Kubelet (CP Node): Detect manifest change
-    Kubelet (CP Node)->>Kube-apiserver Pod (Rev N): Stop Pod
-    Kubelet (CP Node)->>Kube-apiserver Pod (Rev N+1): Start Pod with new certs
+    Kubelet_CP_Node->>Kubelet_CP_Node: Detect manifest change
+    Kubelet_CP_Node->>Kube_apiserver_Pod_RevN: Stop Pod
+    Kubelet_CP_Node->>Kube_apiserver_Pod_RevN1: Start Pod with new certs
 
     alt Signer Cert Rotated (e.g., kube-apiserver-to-kubelet-signer)
-        CKAO CertRotationController->>ConfigMap (CA Bundle): Update CA Bundle (e.g., kube-apiserver-to-kubelet-client-ca)
+        CKAO_CertRotationController->>ConfigMap_CA_Bundle: Update CA Bundle (e.g., kube-apiserver-to-kubelet-client-ca)
 
-        Note over MCO Controller: Monitors CA Bundle ConfigMap
-        MCO Controller->>ConfigMap (CA Bundle): Detects change
-        MCO Controller->>MCO Controller: Read updated CA data
-        MCO Controller->>ControllerConfig CR: Update spec.kubeAPIServerServingCAData
-        MCO Controller->>MachineConfig CR: Generate/Update MachineConfig with new file content for /etc/kubernetes/kubelet-ca.crt
+        Note over MCO_Controller: Monitors CA Bundle ConfigMap
+        MCO_Controller->>ConfigMap_CA_Bundle: Detects change
+        MCO_Controller->>MCO_Controller: Read updated CA data
+        MCO_Controller->>ControllerConfig_CR: Update spec.kubeAPIServerServingCAData
+        MCO_Controller->>MachineConfig_CR: Generate/Update MachineConfig with new file content for /etc/kubernetes/kubelet-ca.crt
 
-        Note over MCD (Node): Monitors assigned MachineConfig
-        MCD (Node)->>MachineConfig CR: Detects new desired config
-        MCD (Node)->>Node Filesystem: Write updated /etc/kubernetes/kubelet-ca.crt
-        MCD (Node)->>MCD (Node): Initiate Node Drain & Reboot (Typical)
-        Note right of Kubelet (Worker Node): Node reboots, Kubelet starts with new CA
+        Note over MCD_Node: Monitors assigned MachineConfig
+        MCD_Node->>MachineConfig_CR: Detects new desired config
+        MCD_Node->>Node_Filesystem: Write updated /etc/kubernetes/kubelet-ca.crt
+        MCD_Node->>MCD_Node: Initiate Node Drain & Reboot (Typical)
+        Note right of Kubelet_Worker_Node: Node reboots, Kubelet starts with new CA
     end
 
 ```
