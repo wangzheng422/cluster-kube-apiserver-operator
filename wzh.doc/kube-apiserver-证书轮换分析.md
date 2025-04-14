@@ -1,6 +1,6 @@
-# OpenShift 中 Kube-apiserver 证书轮换分析
+# OpenShift 4.16 中 Kube-apiserver 证书轮换分析
 
-本文档分析了 OpenShift 集群中与 Kubernetes API 服务器 (`kube-apiserver`) 相关的证书轮换时触发的流程。详细说明了涉及的组件、存储位置、Machine Config Operator (MCO) 的作用，以及 `kube-apiserver` 和 `kubelet` 的更新证书行为。
+本文档分析了 OpenShift 4.16 集群中与 Kubernetes API 服务器 (`kube-apiserver`) 相关的证书轮换时触发的流程。详细说明了涉及的组件、存储位置、Machine Config Operator (MCO) 的作用，以及 `kube-apiserver` 和 `kubelet` 的更新证书行为。
 
 ## 概述
 
