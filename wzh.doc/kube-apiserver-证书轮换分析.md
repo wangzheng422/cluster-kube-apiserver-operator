@@ -47,9 +47,9 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
     *   **目标证书/密钥:** 存储在操作数 (operand) 的命名空间 (`openshift-kube-apiserver`) 内的 Secret 中，例如 `kubelet-client`, `localhost-serving-cert-certkey`。
     *   **CA 包:** 存储在 ConfigMap 中，通常在 Cluster Kube API Server Operator 的命名空间 (`openshift
     *   **目标证书/密钥:** 存储在操作数 (operand) 的命名空间 (`openshift-kube-apiserver`) 内的 Secret 中，例如 `kubelet-client`, `localhost-serving-cert-certkey`。
-    *   **CA 包:** 存储在 ConfigMap 中，通常在 CKAO 的命名空间 (`openshift-kube-apiserver-operator`) 或 `openshift-config-managed` 中，例如 `kube-apiserver-to-kubelet-client-ca`, `kube-apiserver-aggregator-client-ca`。
+    *   **CA 包:** 存储在 ConfigMap 中，通常在 Cluster Kube API Server Operator 的命名空间 (`openshift-kube-apiserver-operator`) 或 `openshift-config-managed` 中，例如 `kube-apiserver-to-kubelet-client-ca`, `kube-apiserver-aggregator-client-ca`。
 
-## Kube-apiserver 重启流程 (CKAO)
+## Kube-apiserver 重启流程 (Cluster Kube API Server Operator)
 
 当 `kube-apiserver` 静态 Pod 直接使用的证书被轮换（在其 Secret 中更新）时，`RevisionController` 会触发重启。
 
@@ -61,7 +61,7 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
     3.  调用 `createRevisionIfNeeded`，确定一个新的版本号 (`nextRevision = latestAvailableRevision + 1`)。
     4.  `createNewRevision` 将基础 Secrets/ConfigMaps 的 *当前* 内容复制到带有 `nextRevision` 后缀的新 Secrets/ConfigMaps 中（例如 `secrets/kubelet-client-4`）。
     5.  关键步骤：`createRevisionIfNeeded` 通过 `operatorClient.UpdateLatestRevisionOperatorStatus` 调用更新 `KubeAPIServer` CR 中的 `status.latestAvailableRevision` 字段。
-    6.  CKAO 中的其他控制器（静态 Pod 管理框架的一部分，如 `InstallerController`, `NodeController`）监控 `KubeAPIServer` CR。它们检测到 `status.latestAvailableRevision` 的变化。
+    6.  Cluster Kube API Server Operator 中的其他控制器（静态 Pod 管理框架的一部分，如 `InstallerController`, `NodeController`）监控 `KubeAPIServer` CR。它们检测到 `status.latestAvailableRevision` 的变化。
     7.  `InstallerController`（很可能）生成一个新的 `kube-apiserver` 静态 Pod 清单 (`pod.yaml`)，该清单引用 `nextRevision`。此清单以及其他版本化资源被放入特定于版本的 ConfigMap 中（例如 `kube-apiserver-pod-4`）。
     8.  `NodeController` 确保此 ConfigMap 被挂载到每个控制平面节点上的正确目录 (`/etc/kubernetes/static-pod-resources/kube-apiserver-pod-<revision>`)，并更新静态 Pod 清单文件 (`/etc/kubernetes/manifests/kube-apiserver-pod.yaml`) 以指向新版本的清单。
     9.  控制平面节点上的 Kubelet 监视 `/etc/kubernetes/manifests` 目录。检测到 `kube-apiserver-pod.yaml` 的更改后，它会优雅地停止旧的 `kube-apiserver` 静态 Pod，并根据更新后的清单启动一个新的 Pod，该清单使用包含已轮换证书的新版本化 Secrets/ConfigMaps。
@@ -113,7 +113,7 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
 
 当静态 Pod 外部组件（如 Kubelet）使用的 CA 包更新时，MCO 和 MCD 处理其到节点的分发。主要示例是 Kubelet 用于验证 `kube-apiserver` 服务证书的 CA 包。
 
-*   **触发器:** 当相应的 *签名者* 证书轮换时，CKAO 的 `CertRotationController` 更新 CA 包 ConfigMap（例如 `openshift-kube-apiserver-operator` 中的 `kube-apiserver-to-kubelet-client-ca`）。
+*   **触发器:** 当相应的 *签名者* 证书轮换时，Cluster Kube API Server Operator 的 `CertRotationController` 更新 CA 包 ConfigMap（例如 `openshift-kube-apiserver-operator` 中的 `kube-apiserver-to-kubelet-client-ca`）。
 *   **组件:** MCO Controller, MCD (Machine Config Daemon)。
 *   **流程:**
     1.  MCO 控制器 (`pkg/operator/sync.go`) 监视相关的 ConfigMap，包括 `kube-apiserver-to-kubelet-client-ca`。
@@ -178,9 +178,9 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
 
 ```mermaid
 sequenceDiagram
-    participant CKAO_CertRot as CKAO CertRotationController
-    participant CKAO_RevCon as CKAO RevisionController
-    participant CKAO_NodeCon as CKAO NodeController
+    participant ClusterKubeAPIServerOperator_CertRot as Cluster Kube API Server Operator CertRotationController
+    participant ClusterKubeAPIServerOperator_RevCon as Cluster Kube API Server Operator RevisionController
+    participant ClusterKubeAPIServerOperator_NodeCon as Cluster Kube API Server Operator NodeController
     participant K8s_API as Kubernetes API
     participant MCO as Machine Config Operator
     participant Kubelet_CP as Kubelet (Control Plane)
@@ -188,22 +188,22 @@ sequenceDiagram
     participant MCD as Machine Config Daemon (Node)
     participant Kubelet_Node as Kubelet (Node)
 
-    Note over CKAO_CertRot, APIServer_Pod: Scenario 1: Target Certificate Rotation (e.g., kubelet-client)
+    Note over ClusterKubeAPIServerOperator_CertRot, APIServer_Pod: Scenario 1: Target Certificate Rotation (e.g., kubelet-client)
 
-    CKAO_CertRot->>K8s_API: 1. Generate new cert/key, Update Target Secret (e.g., openshift-kube-apiserver/kubelet-client)
-    CKAO_RevCon->>K8s_API: 2. Watch Secret, detect change
-    CKAO_RevCon->>K8s_API: 3. Create new Versioned Secret (e.g., openshift-kube-apiserver/kubelet-client-5)
-    CKAO_RevCon->>K8s_API: 4. Update KubeAPIServer CR status.latestAvailableRevision = 5
-    CKAO_NodeCon->>K8s_API: 5. Watch KubeAPIServer CR, detect revision change
-    CKAO_NodeCon->>Kubelet_CP: 6. Write updated manifest (/etc/kubernetes/manifests/kube-apiserver-pod.yaml) referencing revision 5 resources
+    ClusterKubeAPIServerOperator_CertRot->>K8s_API: 1. Generate new cert/key, Update Target Secret (e.g., openshift-kube-apiserver/kubelet-client)
+    ClusterKubeAPIServerOperator_RevCon->>K8s_API: 2. Watch Secret, detect change
+    ClusterKubeAPIServerOperator_RevCon->>K8s_API: 3. Create new Versioned Secret (e.g., openshift-kube-apiserver/kubelet-client-5)
+    ClusterKubeAPIServerOperator_RevCon->>K8s_API: 4. Update KubeAPIServer CR status.latestAvailableRevision = 5
+    ClusterKubeAPIServerOperator_NodeCon->>K8s_API: 5. Watch KubeAPIServer CR, detect revision change
+    ClusterKubeAPIServerOperator_NodeCon->>Kubelet_CP: 6. Write updated manifest (/etc/kubernetes/manifests/kube-apiserver-pod.yaml) referencing revision 5 resources
     Kubelet_CP->>Kubelet_CP: 7. Detect manifest file change
     Kubelet_CP->>APIServer_Pod: 8. Stop old Pod (rev 4)
     Kubelet_CP->>APIServer_Pod: 9. Start new Pod (rev 5) using new versioned Secret
 
-    Note over CKAO_CertRot, Kubelet_Node: Scenario 2: Signer Certificate Rotation (e.g., kube-apiserver-to-kubelet-signer)
+    Note over ClusterKubeAPIServerOperator_CertRot, Kubelet_Node: Scenario 2: Signer Certificate Rotation (e.g., kube-apiserver-to-kubelet-signer)
 
-    CKAO_CertRot->>K8s_API: 1a. Rotate signer cert/key, Update Signer Secret (e.g., openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-signer)
-    CKAO_CertRot->>K8s_API: 1b. Update CA Bundle ConfigMap (e.g., openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-client-ca)
+    ClusterKubeAPIServerOperator_CertRot->>K8s_API: 1a. Rotate signer cert/key, Update Signer Secret (e.g., openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-signer)
+    ClusterKubeAPIServerOperator_CertRot->>K8s_API: 1b. Update CA Bundle ConfigMap (e.g., openshift-kube-apiserver-operator/kube-apiserver-to-kubelet-client-ca)
     MCO->>K8s_API: 2. Watch CA Bundle CM, detect change
     MCO->>K8s_API: 3. Update ControllerConfig CR spec.kubeAPIServerServingCAData
     MCO->>K8s_API: 4. Render & Apply new MachineConfig for relevant pool (master/worker)
@@ -217,8 +217,8 @@ sequenceDiagram
 
 ## 总结
 
-*   **证书轮换触发器:** CKAO 中配置的基于时间的刷新间隔。
-*   **组件:** CKAO (`CertRotationController`, `RevisionController`, Static Pod Controllers), MCO, MCD, Kubelet。
+*   **证书轮换触发器:** Cluster Kube API Server Operator 中配置的基于时间的刷新间隔。
+*   **组件:** Cluster Kube API Server Operator (`CertRotationController`, `RevisionController`, Static Pod Controllers), MCO, MCD, Kubelet。
 *   **证书存储:** `openshift-kube-apiserver-operator` 和 `openshift-kube-apiserver` 命名空间中的 Secret 和 ConfigMap。CA 包也由 MCD 写入节点的 `/etc/kubernetes/kubelet-ca.crt`。
-*   **Kube-apiserver 重启:** **会发生重启**。由 CKAO 的 `RevisionController` 检测到其依赖的 Secrets/ConfigMaps（例如轮换的目标证书 `kubelet-client`）发生更改而触发。CKAO 更新 `KubeAPIServer` CR 状态 (`status.latestAvailableRevision`)，`Static Pod Controller` (如 `NodeController`) 检测到此变化，更新控制平面节点上的静态 Pod 清单 (`/etc/kubernetes/manifests/kube-apiserver-pod.yaml`) 以引用新的版本化资源。Kubelet 监控此清单文件的变化并**重启** `kube-apiserver` Pod。（注意：文档概述部分提到 apiserver 可能仅重新加载证书，但详细的重启流程描述了基于版本变更的重启机制，此处遵循详细流程的描述）。
+*   **Kube-apiserver 重启:** **会发生重启**。由 Cluster Kube API Server Operator 的 `RevisionController` 检测到其依赖的 Secrets/ConfigMaps（例如轮换的目标证书 `kubelet-client`）发生更改而触发。Cluster Kube API Server Operator 更新 `KubeAPIServer` CR 状态 (`status.latestAvailableRevision`)，`Static Pod Controller` (如 `NodeController`) 检测到此变化，更新控制平面节点上的静态 Pod 清单 (`/etc/kubernetes/manifests/kube-apiserver-pod.yaml`) 以引用新的版本化资源。Kubelet 监控此清单文件的变化并**重启** `kube-apiserver` Pod。（注意：文档概述部分提到 apiserver 可能仅重新加载证书，但详细的重启流程描述了基于版本变更的重启机制，此处遵循详细流程的描述）。
 *   **Kubelet 重启:** **不会重启**。当 CA 包 (`kube-apiserver-to-kubelet-client-ca`) 更新时，MCO 检测到变化并生成新的 `MachineConfig`。MCD 将新的 CA 文件写入节点 (`/etc/kubernetes/kubelet-ca.crt`)。由于 MCD 中存在针对此 CA 文件的特殊处理逻辑 (`certificate_writer`)，它直接写入文件而**不触发标准的节点驱逐和重启流程**。Kubelet 监控该 CA 文件的变化并动态**重新加载** CA 包，服务进程本身不重启。
