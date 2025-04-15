@@ -115,30 +115,85 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
 
 *   **触发器:** 当相应的 *签名者* 证书轮换时，Cluster Kube API Server Operator 的 `CertRotationController` 更新 CA 包 ConfigMap（例如 `openshift-kube-apiserver-operator` 中的 `kube-apiserver-to-kubelet-client-ca`）。
 *   **组件:** MCO Controller, MCD (Machine Config Daemon)。
-*   **流程:**
-    1.  MCO 控制器 (`pkg/operator/sync.go`) 监视相关的 ConfigMap，包括 `kube-apiserver-to-kubelet-client-ca`。
+*   **MCO 流程 (更新 ControllerConfig):**
+    1.  MCO 控制器在其 `syncRenderConfig` 逻辑中 (`pkg/operator/sync.go`) 监视相关的 CA 包 ConfigMap (例如 `kube-apiserver-to-kubelet-client-ca`)。
     2.  检测到更改后，它会读取更新后的 CA 包数据 (`ca-bundle.crt`)。
-    3.  此数据 (`kubeAPIServerServingCABytes`) 存储在 MCO 内部的 `ControllerConfig` CR 规范 (`spec.KubeAPIServerServingCAData`) 中。
-    4.  MCO 为相关池（例如 `master`, `worker`）渲染新的 `MachineConfig` 对象。这些 `MachineConfig` 定义了节点上文件的所需状态，包括 Kubelet CA 包的目标路径，并使用 `spec.KubeAPIServerServingCAData` 中的数据填充。
-    5.  在每个节点上运行的 MCD 检测到有新的 `MachineConfig` 可用。
-    6.  MCD 的 `certificate_writer.go` 专门处理将应用的 `ControllerConfig` 的 `Spec.KubeAPIServerServingCAData` 中的 CA 数据写入节点文件系统上的指定路径。
+    3.  此数据 (`kubeAPIServerServingCABytes`) 被用来填充 `ControllerConfigSpec` 结构。
+    4.  `syncControllerConfig` 函数使用此 `spec` 渲染完整的 `ControllerConfig` 对象。
+    5.  MCO 使用 `resourceapply.ApplyControllerConfig` 将此 `ControllerConfig` 对象应用到集群。**注意:** 此步骤是触发下游流程的关键。
+
+*   **MCO `MachineConfig` 生成:**
+    *   MCO 本身**不直接**基于 CA 包的变化来渲染最终的 `MachineConfig`。
+    *   `MachineConfig` 的生成是由 MCO 内部的其他控制器（如 `render-controller`, `template-controller`）处理的。
+    *   这些控制器**监视 `ControllerConfig` CR 的变化**。只有当 `ApplyControllerConfig` 导致 `ControllerConfig` 对象在 API 服务器上**实际发生更新**（例如，`metadata.generation` 增加或 `resourceVersion` 改变）时，这些控制器才会被触发，进而为相关池（例如 `master`, `worker`）渲染新的 `MachineConfig` 对象。
+
+*   **MCD 流程 (写入 CA 包到节点):**
+    1.  MCD (`pkg/daemon/daemon.go`) 使用 Informer 监视 `ControllerConfig` CR 的变化。
+    2.  当 Informer 检测到 `ControllerConfig` 更新时，调用 `handleControllerConfigEvent`。
+    3.  `handleControllerConfigEvent` 将 `ControllerConfig` 的 key 添加到工作队列 `ccQueue`。
+    4.  后台运行的 `controllerConfigWorker` 从队列中取出 key。
+    5.  `controllerConfigWorker` 调用 `syncControllerConfigHandler(key)`。
+    6.  `syncControllerConfigHandler` 获取完整的 `ControllerConfig` 对象。
+    7.  `syncControllerConfigHandler` 调用 `syncKubeletClientCaCerts(controllerConfig)`。
+    8.  `syncKubeletClientCaCerts` 提取 `spec.KubeAPIServerServingCAData`，创建一个 `CertificateWriter` 实例，并调用 `cw.writeFiles(pathToData)` 将 CA 包数据写入节点文件系统上的指定路径 (常量 `caBundleFilePath` 定义为 `/etc/kubernetes/kubelet-ca.crt`)。
 
 *   **存储:** CA 包由 MCD 写入节点文件系统。Kubelet 的 `--client-ca-file` 参数（或相应的 KubeletConfiguration 字段 `clientCAFile`）使用的典型路径是 `/etc/kubernetes/kubelet-ca.crt`。
 
 *   **代码片段:**
 
     ```go
-    // pkg/operator/sync.go - MCO 读取 CA 包 ConfigMap
-    func (optr *Operator) sync(ctx context.Context, syncCtx factory.SyncContext) error {
-        // ... 其他逻辑 ...
-        var kubeAPIServerServingCABytes []byte
-        // ... 根据认证模式确定读取哪个 CM 的逻辑 ...
-        kubeAPIServerServingCABytes, err = optr.getCAsFromConfigMap("openshift-kube-apiserver-operator", "kube-apiserver-to-kubelet-client-ca", "ca-bundle.crt")
+    // pkg/operator/sync.go - MCO 读取 CA 包 ConfigMap 并准备更新 ControllerConfig Spec
+    func (optr *Operator) syncRenderConfig(_ *renderConfig) error {
+        // ... 获取其他配置 ...
+        kubeAPIServerServingCABytes, err := optr.getCAsFromConfigMap("openshift-kube-apiserver-operator", "kube-apiserver-to-kubelet-client-ca", "ca-bundle.crt")
         // ... 错误处理和合并逻辑 ...
 
-        // 存储在 ControllerConfig 规范中
+        // spec 是 ControllerConfigSpec 类型的变量
         spec.KubeAPIServerServingCAData = kubeAPIServerServingCABytes
-        // ... 使用此数据渲染 MachineConfigs ...
+        // ... 填充 spec 的其他字段 ...
+
+        // 将 spec 存储在 optr.renderConfig 中，供 syncControllerConfig 使用
+        optr.renderConfig = getRenderConfig(..., spec, ...)
+        return nil
+    }
+
+    // pkg/operator/sync.go - MCO 应用 ControllerConfig 更新
+    func (optr *Operator) syncControllerConfig(config *renderConfig) error {
+        // ... 渲染 ControllerConfig 对象 'cc' using config.ControllerConfig ...
+        cc.Annotations[daemonconsts.GeneratedByVersionAnnotationKey] = version.Raw // 添加版本注解
+
+        // ApplyControllerConfig 会比较 cc 和集群中现有的 ControllerConfig
+        // 如果 KubeAPIServerServingCAData 等字段没有实际变化，可能不会触发 API 更新
+        _, _, err = mcoResourceApply.ApplyControllerConfig(optr.client.MachineconfigurationV1(), cc)
+        if err != nil {
+            return err
+        }
+        // 等待 ControllerConfig 被 machine-config-controller 处理完成
+        return optr.waitForControllerConfigToBeCompleted(cc)
+    }
+
+
+    // pkg/daemon/daemon.go - MCD 的 ControllerConfig 同步处理入口
+    func (dn *Daemon) syncControllerConfigHandler(key string) error {
+        startTime := time.Now()
+        klog.V(4).Infof("Started syncing ControllerConfig %q (%v)", key, startTime)
+        defer func() {
+            klog.V(4).Infof("Finished syncing ControllerConfig %q (%v)", key, time.Since(startTime))
+        }()
+
+        controllerConfig, err := dn.ccLister.Get(key) // 从 Lister 获取对象
+        // ... 错误处理 (NotFound 等) ...
+
+        // ... 调用其他同步函数，如 syncOSImagePullSecrets, syncTrustedCaCerts ...
+
+        // 调用处理 Kubelet Client CA 的函数
+        if err := dn.syncKubeletClientCaCerts(controllerConfig); err != nil {
+            return err
+        }
+
+        // ... 调用其他同步函数 ...
+
+        return nil
     }
 
     // pkg/daemon/certificate_writer.go - MCD 将 CA 包写入节点
@@ -159,6 +214,32 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
         // ... 可能重启服务 ...
         return nil
     }
+    ```
+
+*   **MCD 调用流程时序图:**
+
+    ```mermaid
+    sequenceDiagram
+        participant K8s_API as Kubernetes API Server
+        participant MCD_Informer as MCD ControllerConfig Informer
+        participant MCD_Queue as MCD Work Queue (ccQueue)
+        participant MCD_Worker as MCD controllerConfigWorker
+        participant MCD_SyncHandler as MCD syncControllerConfigHandler
+        participant MCD_CertSync as MCD syncKubeletClientCaCerts
+        participant MCD_CertWriter as MCD CertificateWriter
+
+        K8s_API-->>MCD_Informer: 1. ControllerConfig Change Event
+        MCD_Informer->>MCD_Queue: 2. Enqueue ControllerConfig Key (via handleControllerConfigEvent & enqueueControllerConfig)
+        MCD_Worker->>MCD_Queue: 3. Dequeue ControllerConfig Key
+        MCD_Worker->>MCD_SyncHandler: 4. Invoke syncControllerConfigHandler(key)
+        MCD_SyncHandler->>K8s_API: 5. Get ControllerConfig from Lister/Cache
+        MCD_SyncHandler->>MCD_CertSync: 6. Call syncKubeletClientCaCerts(config)
+        MCD_CertSync->>MCD_CertWriter: 7. Instantiate CertificateWriter
+        MCD_CertSync->>MCD_CertWriter: 8. Call writeFiles(pathToData)
+        MCD_CertWriter->>MCD_CertWriter: 9. Write CA bundle to node disk (/etc/kubernetes/kubelet-ca.crt)
+        MCD_CertWriter-->>MCD_CertSync: 10. Return success/error
+        MCD_CertSync-->>MCD_SyncHandler: 11. Return success/error
+        MCD_SyncHandler-->>MCD_Worker: 12. Return success/error
     ```
 
 ## Kubelet 与 CA 包更新
