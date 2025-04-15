@@ -142,7 +142,7 @@ Cluster Kube API Server Operator 管理 `kube-apiserver` 所需的各种证书�
     }
 
     // pkg/daemon/certificate_writer.go - MCD 将 CA 包写入节点
-    func (cw *CertificateWriter) writeCertificatesToDisk() error {
+    func (dn *Daemon) syncControllerConfigHandler(key string) error {
         // ... 获取 controllerConfig ...
         kubeAPIServerServingCABytes := controllerConfig.Spec.KubeAPIServerServingCAData
         // ... 其他 CA ...
